@@ -37,6 +37,7 @@ contextBridge.exposeInMainWorld('api', {
   saveRemoteHosts: (hosts) => ipcRenderer.invoke('save-remote-hosts', hosts),
   testRemoteHost: (hostId) => ipcRenderer.invoke('test-remote-host', hostId),
   addRemoteProject: (opts) => ipcRenderer.invoke('add-remote-project', opts),
+  syncRemoteHost: (hostId) => ipcRenderer.invoke('sync-remote-host', hostId),
   remoteBrowse: (opts) => ipcRenderer.invoke('remote-browse', opts),
   writeSshConfig: (host) => ipcRenderer.invoke('write-ssh-config', host),
   remoteConnectStart: (hostId) => ipcRenderer.invoke('remote-connect-start', hostId),

@@ -305,6 +305,15 @@ function renderProjects(projects, resort) {
     settingsBtn.innerHTML = ICONS.gear(16);
     header.appendChild(settingsBtn);
 
+    // Remote projects: refresh past sessions from the host (Phase 2 indexing).
+    if (project.remote) {
+      const refreshBtn = document.createElement('button');
+      refreshBtn.className = 'project-refresh-btn';
+      refreshBtn.title = 'Refresh remote sessions';
+      refreshBtn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
+      header.appendChild(refreshBtn);
+    }
+
     const archiveGroupBtn = document.createElement('button');
     archiveGroupBtn.className = 'project-archive-btn';
     archiveGroupBtn.title = 'Archive all sessions';
@@ -460,6 +469,17 @@ function rebindSidebarEvents(projects) {
     if (settingsBtn) {
       settingsBtn.onclick = (e) => { e.stopPropagation(); openSettingsViewer('project', project.projectPath); };
     }
+    const refreshBtn = header.querySelector('.project-refresh-btn');
+    if (refreshBtn) {
+      refreshBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!project.hostId || !window.api.syncRemoteHost) return;
+        refreshBtn.classList.add('spinning');
+        try { await window.api.syncRemoteHost(project.hostId); } catch {}
+        refreshBtn.classList.remove('spinning');
+        loadProjects();
+      };
+    }
     const archiveGroupBtn = header.querySelector('.project-archive-btn');
     if (archiveGroupBtn) {
       archiveGroupBtn.onclick = async (e) => {
@@ -480,7 +500,7 @@ function rebindSidebarEvents(projects) {
       };
     }
     header.onclick = (e) => {
-      if (e.target.closest('.project-new-btn') || e.target.closest('.project-archive-btn') || e.target.closest('.project-settings-btn') || e.target.closest('.project-schedule-btn')) return;
+      if (e.target.closest('.project-new-btn') || e.target.closest('.project-archive-btn') || e.target.closest('.project-settings-btn') || e.target.closest('.project-schedule-btn') || e.target.closest('.project-refresh-btn')) return;
       header.classList.toggle('collapsed');
     };
   }

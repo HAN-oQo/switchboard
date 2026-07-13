@@ -28,6 +28,7 @@ const cleanPtyEnv = Object.fromEntries(
 // Shell profiles → shell-profiles.js
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, isSshProfile } = require('./shell-profiles');
 const remoteHosts = require('./remote-hosts');
+const remoteIndex = require('./remote-index');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
@@ -62,8 +63,8 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
 }
 const {
   getMeta, getAllMeta, toggleStar, setName, setArchived,
-  isCachePopulated, getAllCached, getCachedByFolder, getCachedFolder, getCachedSession, upsertCachedSessions,
-  deleteCachedSession, deleteCachedFolder,
+  isCachePopulated, getAllCached, getCachedByFolder, getCachedBySource, getCachedFolder, getCachedSession, upsertCachedSessions,
+  deleteCachedSession, deleteCachedFolder, deleteRemoteProjectCache, deleteRemoteProjectCacheByPath,
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
@@ -327,8 +328,14 @@ ipcMain.handle('remove-project', (_event, projectPath) => {
     if (typeof projectPath === 'string' && projectPath.startsWith('ssh://')) {
       const global = getSetting('global') || {};
       global.remoteProjects = (global.remoteProjects || []).filter(p => p.projectPath !== projectPath);
+      // Auto-discovered remote groups aren't in remoteProjects, so also hide the
+      // path (a re-sync would otherwise re-surface it) and drop its indexed rows.
+      const hidden = global.hiddenProjects || [];
+      if (!hidden.includes(projectPath)) hidden.push(projectPath);
+      global.hiddenProjects = hidden;
       setSetting('global', global);
       deleteSetting('project:' + projectPath);
+      try { deleteRemoteProjectCacheByPath(projectPath); } catch {}
       notifyRendererProjectsChanged();
       return { ok: true };
     }
@@ -1005,6 +1012,64 @@ ipcMain.handle('remote-browse', (_event, { hostId, path: remotePath } = {}) => {
   });
 });
 
+// Index a connected host's past remote sessions (Phase 2). Reuses the live
+// ControlMaster socket; transcripts are read over SSH and never copied to disk.
+// Returns { ok, indexed, deleted } or { ok:false, needsAuth } when no live master.
+// `quiet` suppresses the status-bar chatter (used by the silent startup sweep).
+async function runRemoteSync(hostId, { quiet = false } = {}) {
+  const global = getSetting('global') || {};
+  const manual = global.remoteHosts || [];
+  const host = remoteHosts.findRemoteHost(hostId, manual);
+  if (!host) return { ok: false, error: 'unknown host' };
+  const sock = remoteHosts.controlSocketPath(os.tmpdir(), host.id);
+  const label = host.label || host.alias || host.id;
+  if (!quiet) sendStatus('Syncing remote sessions from ' + label + '…', 'active');
+  try {
+    const res = await remoteIndex.syncRemoteHost({
+      host, sock, hostLabel: label,
+      db: { getCachedBySource, upsertCachedSessions, upsertSearchEntries, deleteCachedSession, deleteSearchSession, getMeta, setName },
+    });
+    log.info(`[remote-sync] host=${host.id} indexed=${res.indexed} deleted=${res.deleted}`);
+    notifyRendererProjectsChanged();
+    if (!quiet) {
+      const msg = res.indexed > 0
+        ? `Indexed ${res.indexed} remote session${res.indexed === 1 ? '' : 's'} from ${label}`
+        : `No new remote sessions on ${label}`;
+      sendStatus(msg, 'done');
+      setTimeout(() => sendStatus(''), 4000);
+    }
+    return res;
+  } catch (err) {
+    const emsg = (err && err.message) || String(err);
+    log.info(`[remote-sync] host=${host.id} FAILED: ${emsg}`);
+    if (!quiet) {
+      sendStatus(`Couldn't sync ${label} — connect to the host first.`, 'error');
+      setTimeout(() => sendStatus(''), 5000);
+    }
+    return { ok: false, error: emsg, needsAuth: true };
+  }
+}
+
+ipcMain.handle('sync-remote-host', async (_event, hostId) => {
+  return runRemoteSync(hostId);
+});
+
+// On startup, silently try to index each registered remote host. Key/agent-auth
+// hosts (or ones with a still-live ControlMaster) index without any prompt via
+// BatchMode; password hosts fail fast and are simply skipped until the user
+// connects. Runs in the background so it never blocks the UI.
+function startupRemoteSync() {
+  const global = getSetting('global') || {};
+  // Every host the user has touched: registered remote projects + manual hosts.
+  const ids = [...new Set([
+    ...(global.remoteProjects || []).map((p) => p.hostId),
+    ...(global.remoteHosts || []).map((h) => h.id),
+  ].filter(Boolean))];
+  for (const id of ids) {
+    runRemoteSync(id, { quiet: true }).catch(() => {});
+  }
+}
+
 // --- Scheduled tasks ---
 const scheduleIpc = require('./schedule-ipc');
 
@@ -1088,7 +1153,22 @@ ipcMain.handle('rename-session', (_event, sessionId, name) => {
 });
 
 // --- IPC: archive-session ---
-ipcMain.handle('read-session-jsonl', (_event, sessionId) => {
+ipcMain.handle('read-session-jsonl', async (_event, sessionId) => {
+  const cached = getCachedSession(sessionId);
+  // Remote (Phase 2): stream the transcript live over SSH — nothing is copied to disk.
+  if (cached && cached.source) {
+    const global = getSetting('global') || {};
+    const manual = global.remoteHosts || [];
+    const host = remoteHosts.findRemoteHost(cached.source, manual);
+    if (!host) return { error: 'unknown remote host' };
+    const sock = remoteHosts.controlSocketPath(os.tmpdir(), host.id);
+    try {
+      const entries = await remoteIndex.fetchRemoteSessionEntries({ host, sock, folder: cached.folder, sessionId });
+      return { entries };
+    } catch (err) {
+      return { needsConnect: true, hostLabel: host.label || host.id };
+    }
+  }
   const folder = getCachedFolder(sessionId);
   if (!folder) return { error: 'Session not found in cache' };
   const jsonlPath = path.join(PROJECTS_DIR, folder, sessionId + '.jsonl');
@@ -1239,8 +1319,6 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       const remoteMode = sessionOptions?.remoteMode === 'shell' ? 'shell' : 'claude';
       let innerCmd = null;
       if (remoteMode === 'claude') {
-        // Phase 1 launches a fresh remote Claude session; --session-id/--resume
-        // are managed on the remote host and wired up in a later milestone.
         let cc = 'claude';
         if (sessionOptions?.dangerouslySkipPermissions) {
           cc += ' --dangerously-skip-permissions';
@@ -1250,6 +1328,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         if (sessionOptions?.addDirs) {
           const dirs = sessionOptions.addDirs.split(',').map(d => d.trim()).filter(Boolean);
           for (const dir of dirs) cc += ` --add-dir "${dir}"`;
+        }
+        // Resume / fork a past remote session on the host (the transcript lives
+        // there — same --resume the CLI uses locally, run in the session's dir).
+        if (sessionOptions?.forkFrom) {
+          cc += ` --resume "${sessionOptions.forkFrom}" --fork-session`;
+        } else if (sessionOptions?.resume) {
+          cc += ` --resume "${sessionOptions.resume}"`;
         }
         innerCmd = cc;
       }
@@ -1497,6 +1582,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     activeSessions.delete(realId);
     // Clean up the original key too in case transition detection hasn't run yet
     activeSessions.delete(sessionId);
+
+    // A remote Claude session just wrote/updated its transcript on the host —
+    // re-index that host so the past session shows up in the sidebar/search.
+    if (session.remote && session.remoteHost && session.remoteMode !== 'shell') {
+      const hid = session.remoteHost.id;
+      setTimeout(() => { runRemoteSync(hid).catch(() => {}); }, 1500);
+    }
   });
 
   if (sessionOptions?.forkFrom) {
@@ -1644,6 +1736,9 @@ app.whenReady().then(() => {
   createWindow();
   startProjectsWatcher();
   scheduleIpc.ensureScheduleCreatorCommand();
+  // Index already-reachable remote hosts in the background (Phase 2), so past
+  // remote sessions show up on launch without a manual connect/refresh.
+  setTimeout(() => { try { startupRemoteSync(); } catch {} }, 2000);
 
   // Shared runCommand for both cron scheduler and manual "run now"
   const { spawn: cpSpawn } = require('child_process');

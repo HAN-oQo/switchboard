@@ -134,6 +134,16 @@ function remoteProjectPath(hostLabel, remotePath) {
   return 'ssh://' + hostLabel + '/' + (remotePath && String(remotePath).trim() ? remotePath : '~');
 }
 
+// Inverse of remoteProjectPath: parse "ssh://<label>/<remotePath>" back into its
+// parts. Returns null for non-remote paths.
+function parseRemoteProjectPath(projectPath) {
+  if (typeof projectPath !== 'string' || !projectPath.startsWith('ssh://')) return null;
+  const rest = projectPath.slice('ssh://'.length);
+  const i = rest.indexOf('/');
+  if (i === -1) return { hostLabel: rest, remotePath: '~' };
+  return { hostLabel: rest.slice(0, i), remotePath: rest.slice(i + 1) || '~' };
+}
+
 // Classify a non-interactive ssh probe (see testConnectionArgs). BatchMode never
 // prompts, so a password-auth host "fails" — but its failure text tells us the
 // host is actually reachable and simply needs interactive auth on connect.
@@ -262,6 +272,7 @@ module.exports = {
   buildSshProfile,
   testConnectionArgs,
   remoteProjectPath,
+  parseRemoteProjectPath,
   classifyConnResult,
   controlArgs,
   controlSocketPath,

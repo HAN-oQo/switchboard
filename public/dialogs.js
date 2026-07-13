@@ -26,6 +26,22 @@ async function resolveDefaultSessionOptions(project) {
 async function forkSession(session, project) {
   const options = await resolveDefaultSessionOptions(project);
   options.forkFrom = session.sessionId;
+  // Remote sessions fork on the host (claude --resume <id> --fork-session).
+  if (session.remote || (project && project.remote)) {
+    const host = {
+      id: (project && project.hostId) || session.hostId || session.source,
+      label: (project && project.hostLabel) || session.remoteLabel,
+    };
+    launchRemoteSession(host, {
+      remoteMode: 'claude',
+      remoteDir: (project && project.remotePath) || session.remotePath || '~',
+      forkFrom: session.sessionId,
+      permissionMode: options.permissionMode,
+      dangerouslySkipPermissions: options.dangerouslySkipPermissions,
+      addDirs: options.addDirs,
+    });
+    return;
+  }
   launchNewSession(project, options);
 }
 
@@ -243,6 +259,7 @@ async function launchRemoteSession(host, opts) {
     remoteHostId: host.id,
     remoteMode: mode,
     remoteDir,
+    forkFrom: options.forkFrom || null,
     dangerouslySkipPermissions: options.dangerouslySkipPermissions,
     permissionMode: options.permissionMode,
     addDirs: options.addDirs,
@@ -710,8 +727,11 @@ function connectRemoteHost(host) {
       _rcExit = (id, code) => {
         if (id !== connectId) return;
         _rcData = null; _rcExit = null;
-        if (code === 0) finish(true);
-        else {
+        if (code === 0) {
+          // Master is now live — index this host's past remote sessions (Phase 2).
+          if (window.api.syncRemoteHost) window.api.syncRemoteHost(host.id).catch(() => {});
+          finish(true);
+        } else {
           const lastLine = buffer.split('\n').map(s => s.trim()).filter(Boolean).slice(-1)[0] || '';
           showError('Connection failed' + (lastLine ? ': ' + lastLine : ' (exit ' + code + ').'));
         }
@@ -978,6 +998,9 @@ async function showAddProjectDialog() {
       if (result.error) { showError(result.error); return; }
       close();
       await loadProjects();
+      // Index this project's past sessions now (connect happened before it was
+      // registered, so the connect-time sync saw no projects for this host).
+      if (window.api.syncRemoteHost) window.api.syncRemoteHost(hostId).catch(() => {});
       return;
     }
     const projectPath = pathInput.value.trim();
