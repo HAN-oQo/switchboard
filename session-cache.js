@@ -239,6 +239,24 @@ function buildProjectsFromCache(showArchived) {
     }
   } catch {}
 
+  // Inject persisted remote projects (Model A: a project can be local or remote).
+  // These have no local .jsonl; live sessions launched into them attach below.
+  for (const rp of (global.remoteProjects || [])) {
+    if (!rp || !rp.projectPath) continue;
+    if (hiddenProjects.has(rp.projectPath)) continue;
+    if (!projectMap.has(rp.projectPath)) {
+      projectMap.set(rp.projectPath, {
+        folder: encodeProjectPath(rp.projectPath),
+        projectPath: rp.projectPath,
+        sessions: [],
+        remote: true,
+        hostId: rp.hostId,
+        hostLabel: rp.hostLabel,
+        remotePath: rp.remotePath,
+      });
+    }
+  }
+
   // Inject active plain terminal sessions so they participate in sorting
   for (const [sessionId, session] of activeSessions) {
     if (session.exited || !session.isPlainTerminal) continue;
@@ -253,12 +271,17 @@ function buildProjectsFromCache(showArchived) {
     }
     const proj = projectMap.get(session.projectPath);
     if (!proj.sessions.some(s => s.sessionId === sessionId)) {
+      const remoteLabel = session.remoteHost ? session.remoteHost.label : null;
+      const summary = session.remote
+        ? ((session.remoteMode === 'shell' ? 'Shell @ ' : 'Claude @ ') + remoteLabel)
+        : 'Terminal';
       proj.sessions.push({
-        sessionId, summary: 'Terminal', firstPrompt: '', projectPath: session.projectPath,
+        sessionId, summary, firstPrompt: '', projectPath: session.projectPath,
         name: null, starred: 0, archived: 0, messageCount: 0,
         modified: new Date(session._openedAt).toISOString(),
         created: new Date(session._openedAt).toISOString(),
         type: 'terminal',
+        remote: !!session.remote, remoteLabel, remoteMode: session.remoteMode || null,
       });
     }
   }

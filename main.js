@@ -26,7 +26,8 @@ const cleanPtyEnv = Object.fromEntries(
 );
 
 // Shell profiles → shell-profiles.js
-const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs } = require('./shell-profiles');
+const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, isSshProfile } = require('./shell-profiles');
+const remoteHosts = require('./remote-hosts');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
@@ -322,6 +323,15 @@ ipcMain.handle('add-project', (_event, projectPath) => {
 // --- IPC: remove-project ---
 ipcMain.handle('remove-project', (_event, projectPath) => {
   try {
+    // Remote projects live in settings only (no local .claude/projects folder).
+    if (typeof projectPath === 'string' && projectPath.startsWith('ssh://')) {
+      const global = getSetting('global') || {};
+      global.remoteProjects = (global.remoteProjects || []).filter(p => p.projectPath !== projectPath);
+      setSetting('global', global);
+      deleteSetting('project:' + projectPath);
+      notifyRendererProjectsChanged();
+      return { ok: true };
+    }
     // Add to hidden projects list
     const global = getSetting('global') || {};
     const hidden = global.hiddenProjects || [];
@@ -807,6 +817,194 @@ ipcMain.handle('delete-setting', (_event, key) => {
   return { ok: true };
 });
 
+// --- IPC: remote SSH hosts (Phase 1) ---
+
+// Merged list of remote targets: parsed from ~/.ssh/config plus user-defined
+// manual hosts persisted in global settings under `remoteHosts`.
+ipcMain.handle('get-remote-targets', () => {
+  const manual = (getSetting('global') || {}).remoteHosts || [];
+  return remoteHosts.loadRemoteHosts(manual);
+});
+
+// Persist the manual host list (config-derived hosts are never written back).
+ipcMain.handle('save-remote-hosts', (_event, hosts) => {
+  const global = getSetting('global') || {};
+  const clean = (Array.isArray(hosts) ? hosts : [])
+    .filter(h => h && h.host && String(h.host).trim())
+    .map(h => ({
+      id: h.id || undefined,
+      label: (h.label || '').trim() || undefined,
+      host: String(h.host).trim(),
+      user: (h.user || '').trim() || undefined,
+      port: h.port ? Number(h.port) : undefined,
+      identityFile: (h.identityFile || '').trim() || undefined,
+      options: h.options,
+    }))
+    .map(remoteHosts.normalizeManualHost);
+  global.remoteHosts = clean;
+  setSetting('global', global);
+  return { ok: true, hosts: remoteHosts.loadRemoteHosts(clean) };
+});
+
+// Interactive Connect: authenticate/verify a host inline (not in the sidebar).
+// Runs `ssh -tt <control> <target> true` in a PTY: after auth the trivial command
+// exits (code 0 = connected) while ControlPersist keeps the connection warm for
+// Browse/sessions. Prompts (password/passphrase/host key) are streamed to a small
+// popup terminal in the renderer so the user answers there.
+const _connectProcs = new Map();
+let _connectSeq = 0;
+
+ipcMain.handle('remote-connect-start', (_event, hostId) => {
+  const manual = (getSetting('global') || {}).remoteHosts || [];
+  const host = remoteHosts.findRemoteHost(hostId, manual);
+  if (!host) return { error: 'unknown host' };
+  const sock = remoteHosts.controlSocketPath(os.tmpdir(), host.id);
+  const args = ['-tt', ...remoteHosts.controlArgs(sock), ...remoteHosts.hostTargetArgs(host), 'true'];
+  const connectId = ++_connectSeq;
+  let proc;
+  try {
+    proc = pty.spawn('ssh', args, { name: 'xterm-256color', cols: 80, rows: 16, cwd: os.homedir(), env: cleanPtyEnv });
+  } catch (err) {
+    return { error: err.message };
+  }
+  _connectProcs.set(connectId, proc);
+  const send = (channel, ...a) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, ...a); };
+  proc.onData(d => send('remote-connect-data', connectId, d));
+  proc.onExit(({ exitCode }) => {
+    _connectProcs.delete(connectId);
+    send('remote-connect-exit', connectId, exitCode);
+  });
+  return { connectId };
+});
+
+ipcMain.on('remote-connect-input', (_event, connectId, data) => {
+  const proc = _connectProcs.get(connectId);
+  if (proc) { try { proc.write(data); } catch {} }
+});
+
+ipcMain.handle('remote-connect-cancel', (_event, connectId) => {
+  const proc = _connectProcs.get(connectId);
+  if (proc) { try { proc.kill(); } catch {} }
+  _connectProcs.delete(connectId);
+  return { ok: true };
+});
+
+// Append a host as a proper ~/.ssh/config entry (append-only, backed up once,
+// skips if an entry with that alias already exists).
+ipcMain.handle('write-ssh-config', (_event, host) => {
+  try {
+    if (!host || !host.host) return { error: 'host is required' };
+    const h = remoteHosts.normalizeManualHost(host);
+    const cfgPath = remoteHosts.defaultSshConfigPath();
+    const dir = path.dirname(cfgPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const existing = fs.existsSync(cfgPath) ? fs.readFileSync(cfgPath, 'utf8') : '';
+    // Dedup: does a Host line already list this alias as a whole word?
+    const aliasRe = new RegExp('^\\s*Host\\s+(.*\\s)?' + h.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(\\s.*)?$', 'mi');
+    if (aliasRe.test(existing)) return { error: `Host "${h.label}" already exists in ~/.ssh/config` };
+    // One-time backup before the first Switchboard-written change.
+    const bak = cfgPath + '.switchboard.bak';
+    if (existing && !fs.existsSync(bak)) fs.writeFileSync(bak, existing, { mode: 0o600 });
+    const block = (existing && !existing.endsWith('\n') ? '\n' : '') + '\n# added by Switchboard\n' + remoteHosts.buildSshConfigEntry(h) + '\n';
+    fs.appendFileSync(cfgPath, block, { mode: 0o600 });
+    notifyRendererProjectsChanged();
+    return { ok: true, path: cfgPath, label: h.label };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// Non-interactive connectivity probe (key/agent auth only; never prompts).
+ipcMain.handle('test-remote-host', (_event, hostId) => {
+  const manual = (getSetting('global') || {}).remoteHosts || [];
+  const host = remoteHosts.findRemoteHost(hostId, manual);
+  if (!host) return Promise.resolve({ ok: false, error: 'unknown host' });
+  return new Promise((resolve) => {
+    let out = '';
+    let done = false;
+    const finish = (result) => { if (!done) { done = true; resolve(result); } };
+    let proc;
+    try {
+      proc = pty.spawn('ssh', remoteHosts.testConnectionArgs(host), {
+        name: 'xterm-256color', cols: 80, rows: 24, cwd: os.homedir(), env: cleanPtyEnv,
+      });
+    } catch (err) {
+      return finish({ ok: false, error: err.message });
+    }
+    const killTimer = setTimeout(() => {
+      try { proc.kill(); } catch {}
+      finish({ ok: false, status: 'unreachable', reachable: false, message: 'Timed out', output: out.trim() });
+    }, 15000);
+    proc.onData(d => { out += d; if (out.length > 4000) out = out.slice(-4000); });
+    proc.onExit(({ exitCode }) => {
+      clearTimeout(killTimer);
+      // BatchMode never prompts, so a password-auth host "fails" but is reachable.
+      // Classify the output so the UI reports reachability honestly.
+      const cls = remoteHosts.classifyConnResult(exitCode, out);
+      finish({ ok: cls.reachable, exitCode, ...cls, output: out.trim() });
+    });
+  });
+});
+
+// --- IPC: remote projects (Model A — a project can be local or remote) ---
+
+// Register a remote project (host + remote directory) that appears in the
+// sidebar alongside local projects. Persisted in global settings.
+ipcMain.handle('add-remote-project', (_event, { hostId, remotePath } = {}) => {
+  try {
+    const global = getSetting('global') || {};
+    const manual = global.remoteHosts || [];
+    const host = remoteHosts.findRemoteHost(hostId, manual);
+    if (!host) return { error: 'unknown host' };
+    const dir = (remotePath && String(remotePath).trim()) ? String(remotePath).trim() : '~';
+    const projectPath = remoteHosts.remoteProjectPath(host.label, dir);
+    const list = global.remoteProjects || [];
+    if (!list.some(p => p.projectPath === projectPath)) {
+      list.push({ projectPath, hostId: host.id, hostLabel: host.label, remotePath: dir });
+      global.remoteProjects = list;
+      setSetting('global', global);
+    }
+    notifyRendererProjectsChanged();
+    return { ok: true, projectPath, hostId: host.id, hostLabel: host.label, remotePath: dir };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// List directories at a remote path (for the remote directory browser). Uses the
+// shared control socket (BatchMode = never prompts). If the host needs interactive
+// auth and has no live connection yet, this fails fast with needsAuth so the UI can
+// tell the user to open a session first (which authenticates and persists the master).
+ipcMain.handle('remote-browse', (_event, { hostId, path: remotePath } = {}) => {
+  const manual = (getSetting('global') || {}).remoteHosts || [];
+  const host = remoteHosts.findRemoteHost(hostId, manual);
+  if (!host) return Promise.resolve({ ok: false, error: 'unknown host' });
+  const dir = (remotePath && String(remotePath).trim()) ? String(remotePath).trim() : '~';
+  const sock = remoteHosts.controlSocketPath(os.tmpdir(), host.id);
+  const args = remoteHosts.browseArgs(host, sock, dir);
+  return new Promise((resolve) => {
+    let out = '', err = '', done = false;
+    const finish = (r) => { if (!done) { done = true; resolve(r); } };
+    let proc;
+    try {
+      proc = pty.spawn('ssh', args, { name: 'xterm-256color', cols: 80, rows: 24, cwd: os.homedir(), env: cleanPtyEnv });
+    } catch (e) {
+      return finish({ ok: false, error: e.message });
+    }
+    const killTimer = setTimeout(() => { try { proc.kill(); } catch {} finish({ ok: false, error: 'timed out', path: dir }); }, 12000);
+    // pty merges stdout/stderr; classify on non-zero exit.
+    proc.onData(d => { out += d; if (out.length > 20000) out = out.slice(-20000); });
+    proc.onExit(({ exitCode }) => {
+      clearTimeout(killTimer);
+      if (exitCode === 0) {
+        return finish({ ok: true, path: dir, dirs: remoteHosts.parseLsDirs(out) });
+      }
+      const cls = remoteHosts.classifyConnResult(exitCode, out);
+      finish({ ok: false, path: dir, needsAuth: cls.reachable && cls.status !== 'unreachable', status: cls.status, message: cls.message, output: out.trim().slice(-500) });
+    });
+  });
+});
+
 // --- Scheduled tasks ---
 const scheduleIpc = require('./schedule-ipc');
 
@@ -942,45 +1140,70 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     return { ok: true, reattached: true, mcpActive: !!session.mcpServer };
   }
 
-  // Spawn new PTY
-  if (!fs.existsSync(projectPath)) {
+  const isPlainTerminal = sessionOptions?.type === 'terminal';
+
+  // Remote (SSH) session? Resolve the host + ssh profile up front so we can skip
+  // local-filesystem checks below. Remote sessions run over `ssh` and their
+  // project directory lives on the remote host, not locally.
+  const remoteHostId = sessionOptions?.remoteHostId || null;
+  let remoteHost = null;
+  if (remoteHostId) {
+    const manual = (getSetting('global') || {}).remoteHosts || [];
+    remoteHost = remoteHosts.findRemoteHost(remoteHostId, manual);
+    if (!remoteHost) return { ok: false, error: `unknown remote host: ${remoteHostId}` };
+  }
+  const isRemote = !!remoteHost;
+
+  // Spawn new PTY. Local sessions require an existing project directory; remote
+  // sessions do not (the directory is on the remote host).
+  if (!isRemote && !fs.existsSync(projectPath)) {
     return { ok: false, error: `project directory no longer exists: ${projectPath}` };
   }
 
-  const isPlainTerminal = sessionOptions?.type === 'terminal';
-
-  // Resolve shell profile from effective settings
-  const effectiveProfileId = (() => {
-    const global = getSetting('global') || {};
-    const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
-    let profileId = SETTING_DEFAULTS.shellProfile;
-    if (global.shellProfile !== undefined && global.shellProfile !== null) profileId = global.shellProfile;
-    if (project.shellProfile !== undefined && project.shellProfile !== null) profileId = project.shellProfile;
-    return profileId;
-  })();
-  // WSL profiles only work for plain terminals — Claude CLI sessions need the
-  // Windows shell because session data lives on the Windows filesystem.
-  const requestedProfile = resolveShell(effectiveProfileId);
-  const useWslProfile = isWslShell(requestedProfile.path) && isPlainTerminal;
-  const shellProfile = (isWslShell(requestedProfile.path) && !isPlainTerminal)
-    ? resolveShell('auto')
-    : requestedProfile;
-  const shell = shellProfile.path;
-  const shellExtraArgs = [...(shellProfile.args || [])];
-  const isWsl = isWslShell(shell);
-  // For WSL, convert Windows path to /mnt/ path and pass via --cd;
-  // the spawn cwd must remain a valid Windows path for wsl.exe itself.
-  if (isWsl) {
-    const wslCwd = windowsToWslPath(projectPath);
-    shellExtraArgs.unshift('--cd', wslCwd);
+  // Resolve the shell to spawn.
+  let shell, shellExtraArgs, isWsl;
+  if (isRemote) {
+    shell = 'ssh';
+    // -t (PTY) + connection multiplexing (shared control socket) + target. The
+    // control socket lets the directory browser reuse this authenticated
+    // connection, so the user only authenticates once per host.
+    const sock = remoteHosts.controlSocketPath(os.tmpdir(), remoteHost.id);
+    shellExtraArgs = ['-t', ...remoteHosts.controlArgs(sock), ...remoteHosts.hostTargetArgs(remoteHost)];
+    isWsl = false;
+    log.info(`[shell] remote host=${remoteHost.id} shell=ssh args=${JSON.stringify(shellExtraArgs)}`);
+  } else {
+    // Resolve shell profile from effective settings
+    const effectiveProfileId = (() => {
+      const global = getSetting('global') || {};
+      const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
+      let profileId = SETTING_DEFAULTS.shellProfile;
+      if (global.shellProfile !== undefined && global.shellProfile !== null) profileId = global.shellProfile;
+      if (project.shellProfile !== undefined && project.shellProfile !== null) profileId = project.shellProfile;
+      return profileId;
+    })();
+    // WSL profiles only work for plain terminals — Claude CLI sessions need the
+    // Windows shell because session data lives on the Windows filesystem.
+    const requestedProfile = resolveShell(effectiveProfileId);
+    const shellProfile = (isWslShell(requestedProfile.path) && !isPlainTerminal)
+      ? resolveShell('auto')
+      : requestedProfile;
+    shell = shellProfile.path;
+    shellExtraArgs = [...(shellProfile.args || [])];
+    isWsl = isWslShell(shell);
+    // For WSL, convert Windows path to /mnt/ path and pass via --cd;
+    // the spawn cwd must remain a valid Windows path for wsl.exe itself.
+    if (isWsl) {
+      const wslCwd = windowsToWslPath(projectPath);
+      shellExtraArgs.unshift('--cd', wslCwd);
+    }
+    log.info(`[shell] profile=${shellProfile.id} shell=${shell} args=${JSON.stringify(shellExtraArgs)}`);
   }
-  log.info(`[shell] profile=${shellProfile.id} shell=${shell} args=${JSON.stringify(shellExtraArgs)}`);
 
   let knownJsonlFiles = new Set();
   let sessionSlug = null;
   let projectFolder = null;
 
-  if (!isPlainTerminal) {
+  if (!isPlainTerminal && !isRemote) {
     // Snapshot existing .jsonl files before spawning (for new session + fork/plan detection)
     projectFolder = encodeProjectPath(projectPath);
     const claudeProjectDir = path.join(PROJECTS_DIR, projectFolder);
@@ -1009,7 +1232,40 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   let ptyProcess;
   let mcpServer = null;
   try {
-    if (isPlainTerminal) {
+    if (isRemote) {
+      // Remote (SSH) session: run Claude (or a login shell) on the remote host.
+      // No claude shim and no IDE/MCP emulation — the MCP socket is local and
+      // the CLI on the remote can't reach it (IDE over SSH is a later phase).
+      const remoteMode = sessionOptions?.remoteMode === 'shell' ? 'shell' : 'claude';
+      let innerCmd = null;
+      if (remoteMode === 'claude') {
+        // Phase 1 launches a fresh remote Claude session; --session-id/--resume
+        // are managed on the remote host and wired up in a later milestone.
+        let cc = 'claude';
+        if (sessionOptions?.dangerouslySkipPermissions) {
+          cc += ' --dangerously-skip-permissions';
+        } else if (sessionOptions?.permissionMode) {
+          cc += ` --permission-mode "${sessionOptions.permissionMode}"`;
+        }
+        if (sessionOptions?.addDirs) {
+          const dirs = sessionOptions.addDirs.split(',').map(d => d.trim()).filter(Boolean);
+          for (const dir of dirs) cc += ` --add-dir "${dir}"`;
+        }
+        innerCmd = cc;
+      }
+      const remoteCmd = remoteHosts.buildRemoteCommand(remoteMode, sessionOptions?.remoteDir || '~', innerCmd);
+      ptyProcess = pty.spawn(shell, shellArgs(shell, remoteCmd, shellExtraArgs), {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 30,
+        cwd: os.homedir(), // local cwd; the remote cd happens inside remoteCmd
+        env: {
+          ...cleanPtyEnv,
+          TERM: 'xterm-256color', COLORTERM: 'truecolor',
+          TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+        },
+      });
+    } else if (isPlainTerminal) {
       // Plain terminal: interactive login shell, no claude command
       // Inject a shell function to override `claude` with a helpful message
       const claudeShim = 'claude() { echo "\\033[33mTo start a Claude session, use the + button in the sidebar.\\033[0m"; return 1; }; export -f claude 2>/dev/null;';
@@ -1121,7 +1377,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     outputBuffer: [], outputBufferSize: 0, altScreen: false,
     projectPath, firstResize: true,
     projectFolder, knownJsonlFiles, sessionSlug,
-    isPlainTerminal, forkFrom: sessionOptions?.forkFrom || null,
+    // Remote sessions are treated as live "terminal" entries so they flow through
+    // the sidebar's active-session injection (no local .jsonl indexing yet).
+    isPlainTerminal: isPlainTerminal || isRemote,
+    remote: isRemote, remoteHost: remoteHost || null,
+    remoteMode: isRemote ? (sessionOptions?.remoteMode === 'shell' ? 'shell' : 'claude') : null,
+    forkFrom: sessionOptions?.forkFrom || null,
     mcpServer, _openedAt: Date.now(),
   };
   activeSessions.set(sessionId, session);

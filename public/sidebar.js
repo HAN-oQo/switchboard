@@ -284,8 +284,14 @@ function renderProjects(projects, resort) {
     const header = document.createElement('div');
     header.className = 'project-header';
     header.id = 'ph-' + fId;
-    const shortName = project.projectPath.split('/').filter(Boolean).slice(-2).join('/');
-    header.innerHTML = `<span class="arrow">&#9660;</span> <span class="project-name">${shortName}</span>`;
+    let shortName, remotePrefix = '';
+    if (project.remote) {
+      shortName = `${project.hostLabel} : ${project.remotePath || '~'}`;
+      remotePrefix = '<span class="remote-badge" title="Remote SSH host">SSH</span> ';
+    } else {
+      shortName = project.projectPath.split('/').filter(Boolean).slice(-2).join('/');
+    }
+    header.innerHTML = `<span class="arrow">&#9660;</span> ${remotePrefix}<span class="project-name">${shortName}</span>`;
 
     const scheduleBtn = document.createElement('button');
     scheduleBtn.className = 'project-schedule-btn';
@@ -644,7 +650,10 @@ function buildSessionItem(session) {
   const item = document.createElement('div');
   item.className = 'session-item';
   item.id = 'si-' + session.sessionId;
-  if (session.type === 'terminal') item.classList.add('is-terminal');
+  // A remote Claude session runs `claude` (not a plain shell), so it should read
+  // like a Claude session — no terminal badge/styling, just the SSH badge.
+  const isRemoteClaude = session.remote && session.remoteMode !== 'shell';
+  if (session.type === 'terminal' && !isRemoteClaude) item.classList.add('is-terminal');
   if (session.archived) item.classList.add('archived-item');
   if (activePtyIds.has(session.sessionId)) item.classList.add('has-running-pty');
   if (attentionSessions.has(session.sessionId)) item.classList.add('needs-attention');
@@ -686,11 +695,18 @@ function buildSessionItem(session) {
   metaEl.className = 'session-meta';
   metaEl.textContent = timeStr + (session.messageCount ? ' \u00b7 ' + session.messageCount + ' msgs' : '');
 
-  if (session.type === 'terminal') {
+  if (session.type === 'terminal' && !isRemoteClaude) {
     const badge = document.createElement('span');
     badge.className = 'terminal-badge';
     badge.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>';
     summaryEl.prepend(badge);
+  }
+  if (session.remote) {
+    const rbadge = document.createElement('span');
+    rbadge.className = 'remote-badge';
+    rbadge.textContent = 'SSH';
+    if (session.remoteLabel) rbadge.title = 'Remote: ' + session.remoteLabel;
+    summaryEl.prepend(rbadge);
   }
   info.appendChild(summaryEl);
   info.appendChild(idEl);

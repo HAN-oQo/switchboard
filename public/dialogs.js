@@ -98,11 +98,38 @@ function showNewSessionPopover(project, anchorEl) {
   termBtn.innerHTML = '<svg class="popover-option-icon terminal-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg> Terminal';
   termBtn.onclick = () => { popover.remove(); launchTerminalSession(project); };
 
+  // Remote project: reuse the exact same icons as the local entries (identical
+  // Claude logo), just labeled/wired for running on the project's SSH host.
+  if (project.remote) {
+    const rHost = { id: project.hostId, label: project.hostLabel };
+    const claudeR = document.createElement('button');
+    claudeR.className = 'popover-option';
+    claudeR.innerHTML = claudeBtn.innerHTML.replace('</svg> Claude', '</svg> Claude (remote)');
+    claudeR.onclick = () => { popover.remove(); launchRemoteSession(rHost, { remoteMode: 'claude', remoteDir: project.remotePath }); };
+    const claudeROpts = document.createElement('button');
+    claudeROpts.className = 'popover-option';
+    claudeROpts.innerHTML = claudeBtn.innerHTML.replace('</svg> Claude', '</svg> Claude (remote, Configure…)');
+    claudeROpts.onclick = () => { popover.remove(); showNewSessionDialog(project); };
+    const shellR = document.createElement('button');
+    shellR.className = 'popover-option popover-option-terminal';
+    shellR.innerHTML = termBtn.innerHTML.replace('</svg> Terminal', '</svg> Shell (remote)');
+    shellR.onclick = () => { popover.remove(); launchRemoteSession(rHost, { remoteMode: 'shell', remoteDir: project.remotePath }); };
+    popover.appendChild(claudeR);
+    popover.appendChild(claudeROpts);
+    popover.appendChild(shellR);
+    positionAndBindPopover(popover, anchorEl);
+    return;
+  }
+
   popover.appendChild(claudeBtn);
   popover.appendChild(claudeOptsBtn);
   popover.appendChild(termBtn);
 
-  // Position relative to anchor, flip upward if it would overflow
+  positionAndBindPopover(popover, anchorEl);
+}
+
+// Position a popover under its anchor (flip up on overflow) and close on outside click.
+function positionAndBindPopover(popover, anchorEl) {
   document.body.appendChild(popover);
   const rect = anchorEl.getBoundingClientRect();
   const popoverHeight = popover.offsetHeight;
@@ -113,7 +140,6 @@ function showNewSessionPopover(project, anchorEl) {
   }
   popover.style.left = rect.left + 'px';
 
-  // Close on click outside
   function onClickOutside(e) {
     if (!popover.contains(e.target) && e.target !== anchorEl) {
       popover.remove();
@@ -169,8 +195,71 @@ async function launchTerminalSession(project) {
   pollActiveSessions();
 }
 
+// Launch a session on a remote host over SSH. Modeled on launchTerminalSession:
+// remote sessions are live "terminal" entries with a synthetic ssh:// project
+// path so they group in the sidebar (no local .jsonl indexing in Phase 1).
+async function launchRemoteSession(host, opts) {
+  const options = opts || {};
+  const remoteDir = options.remoteDir || '~';
+  const mode = options.remoteMode === 'shell' ? 'shell' : 'claude';
+  const sessionId = crypto.randomUUID();
+  const projectPath = `ssh://${host.label}/${remoteDir}`;
+  const summary = (mode === 'shell' ? 'Shell @ ' : 'Claude @ ') + host.label;
+  const session = {
+    sessionId,
+    summary,
+    firstPrompt: '',
+    projectPath,
+    name: null,
+    starred: 0,
+    archived: 0,
+    messageCount: 0,
+    modified: new Date().toISOString(),
+    created: new Date().toISOString(),
+    type: 'terminal',
+    remote: true,
+    remoteLabel: host.label,
+    remoteMode: mode,
+  };
+
+  const folder = encodeProjectPath(projectPath);
+  pendingSessions.set(sessionId, { session, projectPath, folder });
+
+  sessionMap.set(sessionId, session);
+  for (const projList of [cachedProjects, cachedAllProjects]) {
+    let proj = projList.find(p => p.projectPath === projectPath);
+    if (!proj) {
+      proj = { folder, projectPath, sessions: [] };
+      projList.unshift(proj);
+    }
+    proj.sessions.unshift(session);
+  }
+  refreshSidebar();
+
+  const entry = createTerminalEntry(session);
+
+  const result = await window.api.openTerminal(sessionId, projectPath, true, {
+    type: 'terminal',
+    remoteHostId: host.id,
+    remoteMode: mode,
+    remoteDir,
+    dangerouslySkipPermissions: options.dangerouslySkipPermissions,
+    permissionMode: options.permissionMode,
+    addDirs: options.addDirs,
+  });
+  if (!result.ok) {
+    entry.terminal.write(`\r\nError: ${result.error}\r\n`);
+    entry.closed = true;
+    return;
+  }
+
+  showSession(sessionId);
+  pollActiveSessions();
+}
+
 async function showNewSessionDialog(project) {
   const effective = await window.api.getEffectiveSettings(project.projectPath);
+  const isRemote = !!project.remote; // Model A: the project itself is local or remote
 
   const overlay = document.createElement('div');
   overlay.className = 'new-session-overlay';
@@ -197,38 +286,54 @@ async function showNewSessionDialog(project) {
     `<button class="permission-option dangerous${dangerousSkip ? ' selected' : ''}" data-mode="dangerous-skip"><span class="perm-name">Dangerous Skip</span><span class="perm-desc">Skip all safety prompts (use with caution)</span></button>`;
   }
 
+  const titleText = isRemote
+    ? `New Remote Session — ${escapeHtml(project.hostLabel)} : ${escapeHtml(project.remotePath || '~')}`
+    : `New Session — ${escapeHtml(project.projectPath.split('/').filter(Boolean).slice(-2).join('/'))}`;
+
   dialog.innerHTML = `
-    <h3>New Session — ${escapeHtml(project.projectPath.split('/').filter(Boolean).slice(-2).join('/'))}</h3>
+    <h3>${titleText}</h3>
+    <div class="settings-field settings-field-wide" id="nsd-remote-dir-field" style="display:${isRemote ? '' : 'none'}">
+      <div class="settings-field-info">
+        <span class="settings-label">Remote Directory</span>
+        <div class="settings-description">Working directory on the remote host</div>
+      </div>
+      <div class="settings-field-control folder-input-row">
+        <input type="text" class="settings-input" id="nsd-remote-dir" placeholder="~/path/to/project" value="${escapeHtml(project.remotePath || '~')}">
+        <button class="add-project-browse-btn" id="nsd-remote-browse" type="button">Browse</button>
+      </div>
+    </div>
     <div class="settings-field">
       <div class="settings-label">Permission Mode</div>
       <div class="permission-grid" id="nsd-mode-grid">${renderModeGrid()}</div>
     </div>
-    <div class="settings-field">
-      <div class="settings-field-info">
-        <span class="settings-label">Worktree</span>
-        <div class="settings-description">Run session in an isolated git worktree</div>
+    <div id="nsd-local-only">
+      <div class="settings-field">
+        <div class="settings-field-info">
+          <span class="settings-label">Worktree</span>
+          <div class="settings-description">Run session in an isolated git worktree</div>
+        </div>
+        <div class="settings-field-control">
+          <input type="text" class="settings-input" id="nsd-worktree-name" placeholder="name (optional)" value="${escapeHtml(effective.worktreeName || '')}" style="width:140px">
+          <label class="settings-toggle"><input type="checkbox" id="nsd-worktree" ${effective.worktree ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+        </div>
       </div>
-      <div class="settings-field-control">
-        <input type="text" class="settings-input" id="nsd-worktree-name" placeholder="name (optional)" value="${escapeHtml(effective.worktreeName || '')}" style="width:140px">
-        <label class="settings-toggle"><input type="checkbox" id="nsd-worktree" ${effective.worktree ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+      <div class="settings-field">
+        <div class="settings-field-info">
+          <span class="settings-label">Chrome</span>
+          <div class="settings-description">Enable Chrome browser automation</div>
+        </div>
+        <div class="settings-field-control">
+          <label class="settings-toggle"><input type="checkbox" id="nsd-chrome" ${effective.chrome ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+        </div>
       </div>
-    </div>
-    <div class="settings-field">
-      <div class="settings-field-info">
-        <span class="settings-label">Chrome</span>
-        <div class="settings-description">Enable Chrome browser automation</div>
-      </div>
-      <div class="settings-field-control">
-        <label class="settings-toggle"><input type="checkbox" id="nsd-chrome" ${effective.chrome ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
-      </div>
-    </div>
-    <div class="settings-field settings-field-wide">
-      <div class="settings-field-info">
-        <span class="settings-label">Pre-launch Command</span>
-        <div class="settings-description">Prepended to the claude command</div>
-      </div>
-      <div class="settings-field-control">
-        <input type="text" class="settings-input" id="nsd-pre-launch" placeholder="e.g. aws-vault exec profile --" value="${escapeHtml(effective.preLaunchCmd || '')}">
+      <div class="settings-field settings-field-wide">
+        <div class="settings-field-info">
+          <span class="settings-label">Pre-launch Command</span>
+          <div class="settings-description">Prepended to the claude command</div>
+        </div>
+        <div class="settings-field-control">
+          <input type="text" class="settings-input" id="nsd-pre-launch" placeholder="e.g. aws-vault exec profile --" value="${escapeHtml(effective.preLaunchCmd || '')}">
+        </div>
       </div>
     </div>
     <div class="settings-field settings-field-wide">
@@ -242,6 +347,7 @@ async function showNewSessionDialog(project) {
     </div>
     <div class="new-session-actions">
       <button class="new-session-cancel-btn">Cancel</button>
+      <button class="new-session-shell-btn" style="display:none">Open shell</button>
       <button class="new-session-start-btn">Start</button>
     </div>
   `;
@@ -269,13 +375,43 @@ async function showNewSessionDialog(project) {
     overlay.remove();
   }
 
-  function start() {
+  // Model A: local vs remote is fixed by the project. Show the matching controls.
+  const localOnly = dialog.querySelector('#nsd-local-only');
+  const shellBtn = dialog.querySelector('.new-session-shell-btn');
+  const startBtn = dialog.querySelector('.new-session-start-btn');
+  if (localOnly) localOnly.style.display = isRemote ? 'none' : '';
+  shellBtn.style.display = isRemote ? '' : 'none';
+  startBtn.textContent = isRemote ? 'Start Claude' : 'Start';
+
+  if (isRemote) {
+    const rbBtn = dialog.querySelector('#nsd-remote-browse');
+    if (rbBtn) rbBtn.onclick = async () => {
+      const inp = dialog.querySelector('#nsd-remote-dir');
+      const picked = await showRemoteDirBrowser({ id: project.hostId, label: project.hostLabel }, inp.value.trim() || '~');
+      if (picked) inp.value = picked;
+    };
+  }
+
+  function permissionOptions() {
     const options = {};
-    if (dangerousSkip) {
-      options.dangerouslySkipPermissions = true;
-    } else if (selectedMode) {
-      options.permissionMode = selectedMode;
+    if (dangerousSkip) options.dangerouslySkipPermissions = true;
+    else if (selectedMode) options.permissionMode = selectedMode;
+    options.addDirs = dialog.querySelector('#nsd-add-dirs').value.trim();
+    return options;
+  }
+
+  function remoteDirValue() {
+    return dialog.querySelector('#nsd-remote-dir').value.trim() || project.remotePath || '~';
+  }
+
+  function start() {
+    if (isRemote) {
+      const options = { ...permissionOptions(), remoteMode: 'claude', remoteDir: remoteDirValue() };
+      close();
+      launchRemoteSession({ id: project.hostId, label: project.hostLabel }, options);
+      return;
     }
+    const options = permissionOptions();
     if (dialog.querySelector('#nsd-worktree').checked) {
       options.worktree = true;
       options.worktreeName = dialog.querySelector('#nsd-worktree-name').value.trim();
@@ -285,14 +421,21 @@ async function showNewSessionDialog(project) {
     }
     const preLaunch = dialog.querySelector('#nsd-pre-launch').value.trim();
     if (preLaunch) options.preLaunchCmd = preLaunch;
-    options.addDirs = dialog.querySelector('#nsd-add-dirs').value.trim();
     if (effective.mcpEmulation === false) options.mcpEmulation = false;
     close();
     launchNewSession(project, options);
   }
 
+  function openShell() {
+    if (!isRemote) return;
+    const options = { remoteMode: 'shell', remoteDir: remoteDirValue() };
+    close();
+    launchRemoteSession({ id: project.hostId, label: project.hostLabel }, options);
+  }
+
   dialog.querySelector('.new-session-cancel-btn').onclick = close;
-  dialog.querySelector('.new-session-start-btn').onclick = start;
+  startBtn.onclick = start;
+  shellBtn.onclick = openShell;
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
   // Keyboard support
@@ -427,19 +570,367 @@ async function showResumeSessionDialog(session) {
 // Settings viewer is in settings-panel.js (openSettingsViewer / closeSettingsViewer)
 // Global settings button & add project button bindings are in app.js (need DOM refs)
 
-function showAddProjectDialog() {
+// Dedicated interactive-connect channel. One connect runs at a time; the module
+// listeners route events to the active handler set by connectRemoteHost().
+let _rcData = null, _rcExit = null;
+if (window.api && window.api.onRemoteConnectData) window.api.onRemoteConnectData((id, data) => { if (_rcData) _rcData(id, data); });
+if (window.api && window.api.onRemoteConnectExit) window.api.onRemoteConnectExit((id, code) => { if (_rcExit) _rcExit(id, code); });
+
+// Structured auth prompt. Presents the right UI for what ssh is asking:
+//  - hostkey  → fingerprint text + Yes/No
+//  - password/passphrase → masked input field
+//  - otp/generic → text field
+// Resolves to the string to send (for hostkey: 'yes'), or null if cancelled.
+function showAuthPrompt(host, p) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'new-session-overlay remote-browser-overlay';
+    const d = document.createElement('div');
+    d.className = 'new-session-dialog';
+    const titles = { password: 'Password', passphrase: 'Key passphrase', otp: 'Verification code', hostkey: 'Verify host key', generic: 'Input required' };
+    const title = titles[p.kind] || 'Input required';
+    const done = (v) => { overlay.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
+    function onKey(e) { if (e.key === 'Escape') done(null); }
+
+    if (p.kind === 'hostkey') {
+      d.innerHTML = `
+        <h3>${title} — ${escapeHtml(host.label || host.id)}</h3>
+        <div class="remote-connect-hint">First time connecting to this host. Confirm the fingerprint to continue.</div>
+        <pre class="auth-fingerprint">${escapeHtml(p.text || '')}</pre>
+        <div class="new-session-actions">
+          <button class="new-session-cancel-btn" id="ap-no">No</button>
+          <button class="new-session-start-btn" id="ap-yes">Yes, connect</button>
+        </div>`;
+      overlay.appendChild(d); document.body.appendChild(overlay);
+      document.addEventListener('keydown', onKey);
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null); });
+      d.querySelector('#ap-yes').onclick = () => done('yes');
+      d.querySelector('#ap-no').onclick = () => done(null);
+      return;
+    }
+
+    const masked = (p.kind === 'password' || p.kind === 'passphrase');
+    d.innerHTML = `
+      <h3>${title} — ${escapeHtml(host.label || host.id)}</h3>
+      <div class="remote-connect-hint">${escapeHtml(p.text || (title + ':'))}</div>
+      <div class="settings-field"><div class="settings-field-control">
+        <input class="settings-input" id="ap-input" type="${masked ? 'password' : 'text'}" autocomplete="off" spellcheck="false" style="width:100%">
+      </div></div>
+      <div class="new-session-actions">
+        <button class="new-session-cancel-btn" id="ap-cancel">Cancel</button>
+        <button class="new-session-start-btn" id="ap-ok">OK</button>
+      </div>`;
+    overlay.appendChild(d); document.body.appendChild(overlay);
+    const inp = d.querySelector('#ap-input');
+    inp.focus();
+    // Submit sends the value to ssh, then clears it from the field immediately.
+    const submit = () => { const v = inp.value; inp.value = ''; done(v); };
+    document.addEventListener('keydown', onKey);
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null); });
+    d.querySelector('#ap-ok').onclick = submit;
+    d.querySelector('#ap-cancel').onclick = () => done(null);
+  });
+}
+
+// Verify/authenticate a host inline (no sidebar session). Resolves true once the
+// connection is established (and warmed via ControlMaster). ssh's prompts are
+// surfaced as structured popups (password field / Yes-No fingerprint) — never a
+// raw terminal. Key/agent hosts connect silently with no popup.
+function connectRemoteHost(host) {
+  return new Promise((resolve) => {
+    let connectId = null, buffer = '', settled = false, promptOpen = false, errModal = null;
+
+    function finish(val) {
+      if (settled) return;
+      settled = true; _rcData = null; _rcExit = null;
+      if (errModal) { errModal.remove(); errModal = null; }
+      resolve(val);
+    }
+
+    // Detect what ssh is waiting for. Only when the buffer ends WITHOUT a newline
+    // (cursor parked at a prompt), which avoids matching normal banner lines.
+    function detectPrompt(buf) {
+      const tail = buf.slice(-1000);
+      if (/\n[ \t]*$/.test(tail)) return null; // ends with newline → not a waiting prompt
+      if (/(authenticity of host|continue connecting \(yes\/no)/i.test(tail) && /\?[ \t]*$/.test(tail)) {
+        const m = tail.match(/The authenticity of host[\s\S]*\?[ \t]*$/i);
+        return { kind: 'hostkey', text: (m ? m[0] : tail).trim() };
+      }
+      if (/enter passphrase for key[^\n]*:[ \t]*$/i.test(tail)) return { kind: 'passphrase', text: tail.split('\n').pop().trim() };
+      if (/password:[ \t]*$/i.test(tail)) return { kind: 'password', text: tail.split('\n').pop().trim() };
+      if (/(verification code|one-time|two-factor|token|otp)[^\n]*:[ \t]*$/i.test(tail)) return { kind: 'otp', text: tail.split('\n').pop().trim() };
+      if (/[:?][ \t]*$/.test(tail)) {
+        const line = tail.split('\n').pop().trim();
+        if (line.length > 1 && line.length < 200) return { kind: 'generic', text: line };
+      }
+      return null;
+    }
+
+    async function handlePrompt(p) {
+      promptOpen = true;
+      const ans = await showAuthPrompt(host, p);
+      promptOpen = false;
+      if (ans === null) { if (connectId != null) window.api.remoteConnectCancel(connectId); finish(false); return; }
+      buffer = '';
+      if (connectId != null) window.api.remoteConnectInput(connectId, ans + '\n');
+    }
+
+    function showError(msg) {
+      if (settled) return;
+      if (errModal) errModal.remove();
+      errModal = document.createElement('div');
+      errModal.className = 'new-session-overlay remote-browser-overlay';
+      const d = document.createElement('div');
+      d.className = 'new-session-dialog';
+      d.innerHTML = `
+        <h3>Connect — ${escapeHtml(host.label || host.id)}</h3>
+        <div class="remote-connect-msg err" style="margin-bottom:12px">${escapeHtml(msg)}</div>
+        <div class="new-session-actions">
+          <button class="new-session-cancel-btn" id="ce-cancel">Cancel</button>
+          <button class="new-session-start-btn" id="ce-retry">Retry</button>
+        </div>`;
+      errModal.appendChild(d); document.body.appendChild(errModal);
+      d.querySelector('#ce-cancel').onclick = () => finish(false);
+      d.querySelector('#ce-retry').onclick = () => { errModal.remove(); errModal = null; start(); };
+    }
+
+    async function start() {
+      buffer = '';
+      const res = await window.api.remoteConnectStart(host.id);
+      if (!res || res.error) { showError((res && res.error) || 'Could not start ssh.'); return; }
+      connectId = res.connectId;
+      _rcData = (id, data) => {
+        if (id !== connectId) return;
+        buffer += data; if (buffer.length > 8000) buffer = buffer.slice(-8000);
+        if (promptOpen) return;
+        const p = detectPrompt(buffer);
+        if (p) handlePrompt(p);
+      };
+      _rcExit = (id, code) => {
+        if (id !== connectId) return;
+        _rcData = null; _rcExit = null;
+        if (code === 0) finish(true);
+        else {
+          const lastLine = buffer.split('\n').map(s => s.trim()).filter(Boolean).slice(-1)[0] || '';
+          showError('Connection failed' + (lastLine ? ': ' + lastLine : ' (exit ' + code + ').'));
+        }
+      };
+    }
+
+    start();
+  });
+}
+
+// Remote directory browser: navigate the remote filesystem over SSH and pick a
+// directory (like the local folder Browse). Resolves to the chosen path or null.
+function showRemoteDirBrowser(host, startPath) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'new-session-overlay remote-browser-overlay';
+    const dialog = document.createElement('div');
+    dialog.className = 'new-session-dialog remote-browser-dialog';
+    dialog.innerHTML = `
+      <h3>Browse — ${escapeHtml(host.label || host.id)}</h3>
+      <div class="folder-input-row">
+        <input type="text" class="settings-input" id="rb-path" value="${escapeHtml(startPath || '~')}" autocomplete="off" spellcheck="false">
+        <button class="add-project-browse-btn" id="rb-go">Go</button>
+      </div>
+      <div class="remote-browser-list" id="rb-list"></div>
+      <div class="remote-browser-msg" id="rb-msg"></div>
+      <div class="new-session-actions">
+        <button class="new-session-cancel-btn" id="rb-cancel">Cancel</button>
+        <button class="new-session-start-btn" id="rb-select">Select this directory</button>
+      </div>`;
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const pathInput = dialog.querySelector('#rb-path');
+    const listEl = dialog.querySelector('#rb-list');
+    const msgEl = dialog.querySelector('#rb-msg');
+    let current = startPath || '~';
+
+    function close(val) { overlay.remove(); document.removeEventListener('keydown', onKey); resolve(val); }
+    function onKey(e) { if (e.key === 'Escape') close(null); }
+    document.addEventListener('keydown', onKey);
+
+    function joinPath(base, name) { return base === '~' ? '~/' + name : base.replace(/\/+$/, '') + '/' + name; }
+    function parentPath(p) {
+      if (p === '~' || p === '/') return p;
+      const t = p.replace(/\/+$/, '');
+      const i = t.lastIndexOf('/');
+      if (i <= 0) return p.startsWith('/') ? '/' : '~';
+      const par = t.slice(0, i);
+      return par === '~' ? '~' : (par || '/');
+    }
+
+    async function load(path) {
+      current = path;
+      pathInput.value = path;
+      msgEl.textContent = '';
+      listEl.innerHTML = '<div class="remote-browser-status">Loading…</div>';
+      let res;
+      try { res = await window.api.remoteBrowse({ hostId: host.id, path }); }
+      catch (e) { listEl.innerHTML = ''; msgEl.textContent = 'Error: ' + e.message; return; }
+      listEl.innerHTML = '';
+      if (!res.ok) {
+        if (res.needsAuth) {
+          msgEl.textContent = 'This host needs interactive login. Open a session to it once to authenticate, then try Browse again — or just type the path.';
+        } else {
+          msgEl.textContent = res.message || res.error || 'Could not list this directory.';
+        }
+        return;
+      }
+      const up = document.createElement('div');
+      up.className = 'remote-browser-item remote-browser-up';
+      up.textContent = '📂 ..';
+      up.onclick = () => load(parentPath(current));
+      listEl.appendChild(up);
+      for (const d of res.dirs) {
+        const it = document.createElement('div');
+        it.className = 'remote-browser-item';
+        it.textContent = '📁 ' + d;
+        it.onclick = () => load(joinPath(current, d));
+        listEl.appendChild(it);
+      }
+      if (!res.dirs.length) {
+        const e = document.createElement('div');
+        e.className = 'remote-browser-status';
+        e.textContent = '(no subdirectories)';
+        listEl.appendChild(e);
+      }
+    }
+
+    dialog.querySelector('#rb-go').onclick = () => load(pathInput.value.trim() || '~');
+    pathInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.stopPropagation(); load(pathInput.value.trim() || '~'); } });
+    dialog.querySelector('#rb-cancel').onclick = () => close(null);
+    dialog.querySelector('#rb-select').onclick = () => close(pathInput.value.trim() || current);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
+
+    load(current);
+  });
+}
+
+// Inline "add SSH host" form. Persists the new host into settings (merged with
+// existing manual hosts) and resolves to the saved host ({id,label,…}) or null.
+function showAddHostDialog() {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'new-session-overlay remote-browser-overlay';
+    const d = document.createElement('div');
+    d.className = 'new-session-dialog';
+    d.innerHTML = `
+      <h3>Add SSH Host</h3>
+      <div class="settings-field"><div class="settings-field-info"><span class="settings-label">Label</span></div><div class="settings-field-control"><input class="settings-input" id="ah-label" placeholder="my-server (optional)"></div></div>
+      <div class="settings-field"><div class="settings-field-info"><span class="settings-label">User</span></div><div class="settings-field-control"><input class="settings-input" id="ah-user" placeholder="user (optional)"></div></div>
+      <div class="settings-field"><div class="settings-field-info"><span class="settings-label">Host</span></div><div class="settings-field-control"><input class="settings-input" id="ah-host" placeholder="hostname or IP"></div></div>
+      <div class="settings-field"><div class="settings-field-info"><span class="settings-label">Port</span></div><div class="settings-field-control"><input class="settings-input" id="ah-port" placeholder="22"></div></div>
+      <div class="settings-field"><div class="settings-field-info"><span class="settings-label">Identity file</span></div><div class="settings-field-control"><input class="settings-input" id="ah-identity" placeholder="~/.ssh/id_ed25519 (optional)"></div></div>
+      <div class="settings-field">
+        <div class="settings-field-info">
+          <span class="settings-label">Extra options</span>
+          <div class="settings-description">Extra <code>ssh -o</code> options for legacy/special hosts — leave blank for most. Click to add:</div>
+          <div class="ah-opt-chips">
+            <button type="button" class="ah-chip" data-opt="HostKeyAlgorithms=+ssh-rsa">HostKeyAlgorithms=+ssh-rsa</button>
+            <button type="button" class="ah-chip" data-opt="PubkeyAcceptedKeyTypes=+ssh-rsa">PubkeyAcceptedKeyTypes=+ssh-rsa</button>
+            <button type="button" class="ah-chip" data-opt="PreferredAuthentications=password">PreferredAuthentications=password</button>
+            <button type="button" class="ah-chip" data-opt="ProxyJump=bastion">ProxyJump=bastion</button>
+            <button type="button" class="ah-chip" data-opt="ServerAliveInterval=30">ServerAliveInterval=30</button>
+          </div>
+        </div>
+        <div class="settings-field-control"><input class="settings-input" id="ah-options" placeholder="comma-separated Key=Value (optional)"></div>
+      </div>
+      <div class="remote-connect-msg" id="ah-err"></div>
+      <div class="new-session-actions">
+        <button class="new-session-cancel-btn" id="ah-cancel">Cancel</button>
+        <button class="new-session-start-btn" id="ah-save">Save host</button>
+      </div>`;
+    overlay.appendChild(d);
+    document.body.appendChild(overlay);
+    d.querySelector('#ah-host').focus();
+
+    function close(v) { overlay.remove(); document.removeEventListener('keydown', onKey); resolve(v); }
+    function onKey(e) { if (e.key === 'Escape') close(null); }
+    document.addEventListener('keydown', onKey);
+    const setErr = (m) => { const e = d.querySelector('#ah-err'); e.textContent = m; e.className = 'remote-connect-msg err'; };
+
+    d.querySelector('#ah-cancel').onclick = () => close(null);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+    // Example-option chips: click to append (deduped) into the options field.
+    d.querySelectorAll('.ah-chip').forEach(chip => {
+      chip.onclick = () => {
+        const inp = d.querySelector('#ah-options');
+        const parts = inp.value.split(',').map(s => s.trim()).filter(Boolean);
+        if (!parts.includes(chip.dataset.opt)) parts.push(chip.dataset.opt);
+        inp.value = parts.join(', ');
+      };
+    });
+    d.querySelector('#ah-save').onclick = async () => {
+      const host = d.querySelector('#ah-host').value.trim();
+      if (!host) { setErr('Host is required.'); return; }
+      const newHost = {
+        label: d.querySelector('#ah-label').value.trim(),
+        user: d.querySelector('#ah-user').value.trim(),
+        host,
+        port: d.querySelector('#ah-port').value.trim(),
+        identityFile: d.querySelector('#ah-identity').value.trim(),
+        options: d.querySelector('#ah-options').value.trim(),
+      };
+      let existing = [];
+      try { existing = (await window.api.getRemoteTargets()).filter(h => h.source === 'manual'); } catch {}
+      const res = await window.api.saveRemoteHosts([...existing, newHost]);
+      if (!res || !res.ok) { setErr('Failed to save host.'); return; }
+      const saved = (res.hosts || []).find(h => h.source === 'manual' && h.host === host && (h.user || '') === (newHost.user || '')) || null;
+      close(saved);
+    };
+  });
+}
+
+async function showAddProjectDialog() {
   const overlay = document.createElement('div');
   overlay.className = 'add-project-overlay';
 
   const dialog = document.createElement('div');
   dialog.className = 'add-project-dialog';
 
+  // Load remote SSH targets for the Remote tab.
+  let remoteTargets = [];
+  try { remoteTargets = await window.api.getRemoteTargets(); } catch {}
+  const buildHostOptions = (targets) =>
+    (targets.length ? '' : '<option value="" disabled selected>(no hosts yet)</option>') +
+    targets.map(h => `<option value="${escapeHtml(h.id)}">${escapeHtml(h.label)}${h.source === 'config' ? ' (ssh config)' : ''}</option>`).join('') +
+    '<option value="__add__">+ Add new host…</option>';
+  const hostOptions = buildHostOptions(remoteTargets);
+
   dialog.innerHTML = `
     <h3>Add Project</h3>
-    <div class="add-project-hint">Select a folder to create a new project. To start a session in an existing project, use the + on its project header.</div>
-    <div class="folder-input-row">
-      <input type="text" id="add-project-path" placeholder="/path/to/project" autocomplete="off" spellcheck="false">
-      <button class="add-project-browse-btn">Browse</button>
+    <div class="add-project-tabs">
+      <button class="add-project-tab selected" data-tab="local">Local folder</button>
+      <button class="add-project-tab" data-tab="remote">Remote (SSH)</button>
+    </div>
+    <div id="add-project-local">
+      <div class="add-project-hint">Select a folder to create a new project. To start a session in an existing project, use the + on its project header.</div>
+      <div class="folder-input-row">
+        <input type="text" id="add-project-path" placeholder="/path/to/project" autocomplete="off" spellcheck="false">
+        <button class="add-project-browse-btn">Browse</button>
+      </div>
+    </div>
+    <div id="add-project-remote" style="display:none">
+      <div class="add-project-hint">Choose an SSH host and a remote directory — or pick <strong>+ Add new host…</strong> to define one here. If the host needs a password, click <strong>Connect</strong> to log in once, then Browse.</div>
+      <div class="settings-field">
+        <div class="settings-field-info"><span class="settings-label">Host</span></div>
+        <div class="settings-field-control folder-input-row">
+          <select class="settings-select" id="add-remote-host">${hostOptions}</select>
+          <button class="add-project-browse-btn" id="add-remote-connect" type="button" title="Log in / verify the connection">Connect</button>
+        </div>
+      </div>
+      <div class="settings-field">
+        <div class="settings-field-info"><span class="settings-label">Remote directory</span></div>
+        <div class="settings-field-control folder-input-row">
+          <input type="text" class="settings-input" id="add-remote-path" placeholder="~/path/to/project" value="~">
+          <button class="add-project-browse-btn" id="add-remote-browse" type="button">Browse</button>
+        </div>
+      </div>
     </div>
     <div class="add-project-error" id="add-project-error"></div>
     <div class="add-project-actions">
@@ -453,29 +944,47 @@ function showAddProjectDialog() {
 
   const pathInput = dialog.querySelector('#add-project-path');
   const errorEl = dialog.querySelector('#add-project-error');
+  const localPane = dialog.querySelector('#add-project-local');
+  const remotePane = dialog.querySelector('#add-project-remote');
+  let tab = 'local';
   pathInput.focus();
+
+  dialog.querySelectorAll('.add-project-tab').forEach(btn => {
+    btn.onclick = () => {
+      tab = btn.dataset.tab;
+      dialog.querySelectorAll('.add-project-tab').forEach(b => b.classList.toggle('selected', b === btn));
+      localPane.style.display = tab === 'local' ? '' : 'none';
+      remotePane.style.display = tab === 'remote' ? '' : 'none';
+      errorEl.style.display = 'none';
+    };
+  });
 
   function close() {
     overlay.remove();
     document.removeEventListener('keydown', onKey);
   }
 
-  async function addProject() {
-    const projectPath = pathInput.value.trim();
-    if (!projectPath) {
-      errorEl.textContent = 'Please enter a folder path.';
-      errorEl.style.display = 'block';
-      return;
-    }
-    errorEl.style.display = 'none';
-    const result = await window.api.addProject(projectPath);
-    if (result.error) {
-      errorEl.textContent = result.error;
-      errorEl.style.display = 'block';
-      return;
-    }
-    close();
+  function showError(msg) { errorEl.textContent = msg; errorEl.style.display = 'block'; }
 
+  async function addProject() {
+    errorEl.style.display = 'none';
+    if (tab === 'remote') {
+      const hostSel = dialog.querySelector('#add-remote-host');
+      if (!hostSel) { showError('No SSH hosts configured. Add them in Settings → Remote Hosts.'); return; }
+      const hostId = hostSel.value;
+      if (!hostId || hostId === '__add__') { showError('Select or add a host.'); return; }
+      const remotePath = dialog.querySelector('#add-remote-path').value.trim() || '~';
+      const result = await window.api.addRemoteProject({ hostId, remotePath });
+      if (result.error) { showError(result.error); return; }
+      close();
+      await loadProjects();
+      return;
+    }
+    const projectPath = pathInput.value.trim();
+    if (!projectPath) { showError('Please enter a folder path.'); return; }
+    const result = await window.api.addProject(projectPath);
+    if (result.error) { showError(result.error); return; }
+    close();
     await loadProjects();
   }
 
@@ -483,6 +992,62 @@ function showAddProjectDialog() {
     const folder = await window.api.browseFolder();
     if (folder) pathInput.value = folder;
   };
+
+  // "+ Add new host…" in the host dropdown opens an inline add-host form.
+  const hostSelEl = dialog.querySelector('#add-remote-host');
+  if (hostSelEl) {
+    let prevValue = hostSelEl.value;
+    hostSelEl.addEventListener('change', async () => {
+      if (hostSelEl.value !== '__add__') { prevValue = hostSelEl.value; return; }
+      const saved = await showAddHostDialog();
+      if (saved) {
+        try { remoteTargets = await window.api.getRemoteTargets(); } catch {}
+        hostSelEl.innerHTML = buildHostOptions(remoteTargets);
+        hostSelEl.value = saved.id;
+        prevValue = hostSelEl.value;
+      } else {
+        hostSelEl.value = prevValue;
+      }
+    });
+  }
+
+  const isRealHost = () => { const v = hostSelEl && hostSelEl.value; return v && v !== '__add__'; };
+
+  // Remote directory Browse
+  const remoteBrowseBtn = dialog.querySelector('#add-remote-browse');
+  if (remoteBrowseBtn) {
+    remoteBrowseBtn.onclick = async () => {
+      if (!isRealHost()) { showError('Select or add a host first.'); return; }
+      const hostSel = dialog.querySelector('#add-remote-host');
+      const remotePathInput = dialog.querySelector('#add-remote-path');
+      const t = remoteTargets.find(h => h.id === hostSel.value);
+      const host = { id: hostSel.value, label: (t && t.label) || hostSel.value };
+      const picked = await showRemoteDirBrowser(host, remotePathInput.value.trim() || '~');
+      if (picked) remotePathInput.value = picked;
+    };
+  }
+
+  // Interactive Connect: open a real shell to the selected host to authenticate
+  // (password/pubkey/legacy). Closes this dialog and warms the connection so a
+  // subsequent Add → Browse works. The host label carries the ssh-config suffix,
+  // so strip it back to the pickable label for the session.
+  const remoteConnectBtn = dialog.querySelector('#add-remote-connect');
+  if (remoteConnectBtn) {
+    remoteConnectBtn.onclick = async () => {
+      if (!isRealHost()) { showError('Select or add a host first.'); return; }
+      const hostSel = dialog.querySelector('#add-remote-host');
+      const t = remoteTargets.find(h => h.id === hostSel.value);
+      const host = { id: hostSel.value, label: (t && t.label) || hostSel.value };
+      const orig = remoteConnectBtn.textContent;
+      remoteConnectBtn.disabled = true;
+      remoteConnectBtn.textContent = 'Connecting…';
+      remoteConnectBtn.classList.remove('connected');
+      const ok = await connectRemoteHost(host);
+      remoteConnectBtn.disabled = false;
+      if (ok) { remoteConnectBtn.textContent = '✓ Connected'; remoteConnectBtn.classList.add('connected'); }
+      else { remoteConnectBtn.textContent = orig; }
+    };
+  }
 
   dialog.querySelector('.add-project-cancel-btn').onclick = close;
   dialog.querySelector('.add-project-add-btn').onclick = addProject;
