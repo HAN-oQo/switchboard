@@ -73,6 +73,7 @@
     const maxAgeValue = fieldValue('sessionMaxAgeDays', 3);
     const themeValue = fieldValue('terminalTheme', 'switchboard');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
+    const remoteIdeValue = fieldValue('remoteIde', false);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
 
     // Discover available shell profiles
@@ -240,6 +241,16 @@
             <label class="settings-toggle"><input type="checkbox" id="sv-mcp-emulation" ${mcpEmulationValue ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
           </div>
         </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">IDE integration over SSH</span>
+            <div class="settings-description">Let <strong>remote</strong> Claude sessions open files and diffs in Switchboard's side panel, like local ones. This reverse-forwards the local IDE port to the remote host (protected by a per-session token) — enable only for hosts you trust. Off by default; applies to new remote sessions.</div>
+          </div>
+          <div class="settings-field-control">
+            <label class="settings-toggle"><input type="checkbox" id="sv-remote-ide" ${remoteIdeValue ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+          </div>
+        </div>
       </div>` : ''}
 
       ${!isProject ? `<div class="settings-section">
@@ -323,6 +334,8 @@
         settings.sessionMaxAgeDays = parseInt(settingsViewerBody.querySelector('#sv-max-age').value) || 3;
         settings.terminalTheme = settingsViewerBody.querySelector('#sv-terminal-theme').value || 'switchboard';
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
+        const remoteIdeCb = settingsViewerBody.querySelector('#sv-remote-ide');
+        if (remoteIdeCb) settings.remoteIde = remoteIdeCb.checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
       }
 
