@@ -1235,6 +1235,32 @@ function teardownRemoteIdeTunnel(host, sock, remotePort, localPort, log) {
   try { cp.spawnSync('ssh', remoteIde.remoteLockCleanupArgs(host, sock, remotePort), { timeout: 8000 }); } catch {}
 }
 
+// Update + broadcast a session's Remote Control state. When enabling, arm a
+// timer: if no session URL is observed shortly, the mode did not actually start
+// (old CLI / wrong plan / non-anthropic base URL), so revert to off+unavailable.
+const RC_CONFIRM_MS = 8000;
+function setRemoteControlState(session, sessionId, patch, armTimer) {
+  if (!session) return;
+  session.remoteControl = Object.assign(
+    { enabled: false, name: null, url: null, unavailable: false },
+    session.remoteControl || {},
+    patch
+  );
+  if (session._rcTimer) { clearTimeout(session._rcTimer); session._rcTimer = null; }
+  if (armTimer) {
+    session._rcTimer = setTimeout(() => {
+      session._rcTimer = null;
+      if (session.remoteControl && session.remoteControl.enabled && !session.remoteControl.url) {
+        setRemoteControlState(session, sessionId, { enabled: false, unavailable: true });
+      }
+    }, RC_CONFIRM_MS);
+    if (session._rcTimer.unref) session._rcTimer.unref();
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('remote-control-state', sessionId, session.remoteControl);
+  }
+}
+
 // --- IPC: open-terminal ---
 ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions) => {
   if (!mainWindow) return { ok: false, error: 'no window' };
@@ -1553,8 +1579,23 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   };
   activeSessions.set(sessionId, session);
 
+  if (sessionOptions?.remoteControl) {
+    setRemoteControlState(session, sessionId, {
+      enabled: true,
+      name: sessionOptions.remoteControlName || null,
+    }, true /* armTimer */);
+  }
+
   ptyProcess.onData(data => {
     const currentId = session.realSessionId || sessionId;
+
+    // Remote Control: capture the session URL to confirm the mode is active.
+    if (data.includes('claude.ai/code/')) {
+      const sig = remoteControl.parseRemoteControlSignal(data);
+      if (sig.url && (!session.remoteControl || session.remoteControl.url !== sig.url)) {
+        setRemoteControlState(session, currentId, { enabled: true, url: sig.url, unavailable: false });
+      }
+    }
 
     // Parse OSC sequences (title changes, progress, notifications, etc.)
     if (data.includes('\x1b]')) {
@@ -1667,6 +1708,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         mainWindow.webContents.send('process-exited', sessionId, exitCode);
       }
     }
+    if (session._rcTimer) { clearTimeout(session._rcTimer); session._rcTimer = null; }
+
     activeSessions.delete(realId);
     // Clean up the original key too in case transition detection hasn't run yet
     activeSessions.delete(sessionId);

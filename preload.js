@@ -72,6 +72,9 @@ contextBridge.exposeInMainWorld('api', {
   onCliBusyState: (callback) => {
     ipcRenderer.on('cli-busy-state', (_event, sessionId, busy) => callback(sessionId, busy));
   },
+  onRemoteControlState: (callback) => {
+    ipcRenderer.on('remote-control-state', (_event, sessionId, state) => callback(sessionId, state));
+  },
   onSessionForked: (callback) => {
     ipcRenderer.on('session-forked', (_event, oldId, newId) => callback(oldId, newId));
   },
