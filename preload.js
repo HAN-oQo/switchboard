@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('api', {
   renameSession: (id, name) => ipcRenderer.invoke('rename-session', id, name),
   archiveSession: (id, archived) => ipcRenderer.invoke('archive-session', id, archived),
   openTerminal: (id, projectPath, isNew, sessionOptions) => ipcRenderer.invoke('open-terminal', id, projectPath, isNew, sessionOptions),
+  toggleRemoteControl: (id) => ipcRenderer.invoke('session:toggle-remote-control', id),
   search: (type, query, titleOnly) => ipcRenderer.invoke('search', type, query, titleOnly),
   readSessionJsonl: (sessionId) => ipcRenderer.invoke('read-session-jsonl', sessionId),
 
@@ -71,6 +72,9 @@ contextBridge.exposeInMainWorld('api', {
   },
   onCliBusyState: (callback) => {
     ipcRenderer.on('cli-busy-state', (_event, sessionId, busy) => callback(sessionId, busy));
+  },
+  onRemoteControlState: (callback) => {
+    ipcRenderer.on('remote-control-state', (_event, sessionId, state) => callback(sessionId, state));
   },
   onSessionForked: (callback) => {
     ipcRenderer.on('session-forked', (_event, oldId, newId) => callback(oldId, newId));

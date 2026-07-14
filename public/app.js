@@ -13,6 +13,12 @@ const terminalHeaderId = document.getElementById('terminal-header-id');
 const terminalHeaderStatus = document.getElementById('terminal-header-status');
 const terminalHeaderShell = document.getElementById('terminal-header-shell');
 const terminalStopBtn = document.getElementById('terminal-stop-btn');
+const terminalHeaderRcBtn = document.getElementById('terminal-header-rc-btn');
+const rcPopover = document.getElementById('rc-popover');
+const rcPopoverUrl = document.getElementById('rc-popover-url');
+const rcCopyBtn = document.getElementById('rc-copy-btn');
+const rcOpenBtn = document.getElementById('rc-open-btn');
+const rcPopoverClose = document.getElementById('rc-popover-close');
 const runningToggle = document.getElementById('running-toggle');
 const todayToggle = document.getElementById('today-toggle');
 const planViewer = document.getElementById('plan-viewer');
@@ -59,6 +65,7 @@ function setActiveSession(id) {
   else sessionStorage.removeItem('activeSessionId');
   // Update file panel to show this session's open files/diffs
   if (typeof switchPanel === 'function') switchPanel(id);
+  updateRcHeader(id);
 }
 // Persist slug group expand state across reloads
 function getExpandedSlugs() {
@@ -112,6 +119,9 @@ const attentionSessions = new Set(); // sessions needing user action (OSC 9)
 const responseReadySessions = new Set(); // Claude finished, user hasn't looked (terminal state)
 const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 const lastActivityTime = new Map(); // sessionId → Date of last terminal output
+const sessionRcState = new Map(); // sessionId → { enabled, url, name, unavailable }
+const sessionRcPopoverShown = new Map(); // sessionId → boolean, whether the popover auto-opened for the current "on" streak
+let rcPopoverSessionId = null; // sessionId the popover is currently showing a URL for, if visible
 
 // Noise patterns — these don't count as activity
 const activityNoiseRe = /file-history-snapshot|^\s*$/;
@@ -251,6 +261,12 @@ window.api.onSessionForked((oldId, newId) => {
   sessionMap.delete(oldId);
   sessionMap.set(newId, entry.session);
 
+  if (sessionRcState.has(oldId)) { sessionRcState.set(newId, sessionRcState.get(oldId)); sessionRcState.delete(oldId); }
+  sessionRcPopoverShown.delete(oldId);
+  if (rcPopoverSessionId === oldId) rcPopoverSessionId = newId;
+  applyRcBadge(newId);
+  if (activeSessionId === newId) updateRcHeader(newId);
+
   terminalHeaderId.textContent = newId;
 
   loadProjects().then(() => {
@@ -270,6 +286,13 @@ window.api.onProcessExited((sessionId, exitCode) => {
   const session = sessionMap.get(sessionId);
   if (entry) {
     entry.closed = true;
+  }
+
+  if (sessionRcState.has(sessionId)) {
+    sessionRcState.delete(sessionId);
+    sessionRcPopoverShown.delete(sessionId);
+    applyRcBadge(sessionId);
+    if (sessionId === activeSessionId) updateRcHeader(sessionId);
   }
 
   // Clean up terminal UI on exit (uses destroySession to handle grid cards too)
@@ -341,7 +364,119 @@ window.api.onTerminalNotification((sessionId, message) => {
 // --- CLI busy state (OSC 0 title spinner detection) ---
 window.api.onCliBusyState((sessionId, busy) => {
   setActivity(sessionId, busy);
+  if (sessionId === activeSessionId) updateRcHeader(sessionId);
 });
+
+// --- Remote Control badge (sidebar + grid overview) ---
+// Show/enable the header RC button + reflect state for the active session.
+function updateRcHeader(sessionId) {
+  if (!terminalHeaderRcBtn) return;
+  if (sessionId && sessionId !== activeSessionId) return;
+  const entry = activeSessionId ? openSessions.get(activeSessionId) : null;
+  const s = entry?.session;
+  const isClaude = !!entry && (s?.type !== 'terminal' || s?.remoteMode === 'claude');
+  terminalHeaderRcBtn.style.display = isClaude ? '' : 'none';
+  if (!isClaude) { hideRcPopover(); return; }
+  const state = sessionRcState.get(activeSessionId);
+  const on = !!(state && state.enabled);
+  const confirmed = on && !!state.url;
+  const busy = sessionBusyState.get(activeSessionId) || false;
+  terminalHeaderRcBtn.classList.toggle('rc-on', confirmed);
+  terminalHeaderRcBtn.classList.toggle('rc-pending', on && !confirmed);
+  terminalHeaderRcBtn.disabled = busy;
+  terminalHeaderRcBtn.title = busy
+    ? 'Wait until Claude is idle to toggle Remote Control'
+    : (on ? 'Remote Control ON — click to turn off' : 'Turn on Remote Control');
+
+  // Auto-open the popover the instant this session's URL is first confirmed
+  // (guarded so it fires once per "on" streak, not on every state event or
+  // session switch); hide it whenever RC is off/pending, or the active
+  // session isn't a confirmed one.
+  if (!on) sessionRcPopoverShown.delete(activeSessionId);
+  if (rcPopover && rcPopover.style.display !== 'none' && rcPopoverSessionId !== activeSessionId) {
+    hideRcPopover();
+  }
+  if (confirmed) {
+    if (!sessionRcPopoverShown.get(activeSessionId)) {
+      sessionRcPopoverShown.set(activeSessionId, true);
+      showRcPopover();
+    }
+  } else {
+    hideRcPopover();
+  }
+}
+
+// --- Remote Control popover (copy link / open in browser) ---
+function hideRcPopover() {
+  if (rcPopover) rcPopover.style.display = 'none';
+}
+
+function showRcPopover() {
+  const state = sessionRcState.get(activeSessionId);
+  if (!state || !state.url) { hideRcPopover(); return; }
+  if (rcPopoverUrl) rcPopoverUrl.textContent = state.url;
+  rcPopoverSessionId = activeSessionId;
+  if (rcPopover) rcPopover.style.display = '';
+}
+
+if (rcCopyBtn) rcCopyBtn.addEventListener('click', () => {
+  const state = sessionRcState.get(activeSessionId);
+  if (!state || !state.url) return;
+  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+    console.warn('[remote-control] clipboard API unavailable');
+    return;
+  }
+  navigator.clipboard.writeText(state.url).catch((err) => {
+    console.warn('[remote-control] failed to copy link', err);
+  });
+});
+
+if (rcOpenBtn) rcOpenBtn.addEventListener('click', () => {
+  const state = sessionRcState.get(activeSessionId);
+  if (state && state.url) window.api.openExternal(state.url);
+});
+
+if (rcPopoverClose) rcPopoverClose.addEventListener('click', () => hideRcPopover());
+
+// Note: Remote Control toggled manually *inside* the terminal (e.g. the user types
+// the toggle shortcut themselves on a session Switchboard didn't launch with the
+// flag or toggle via its own button) is intentionally not detected here — main.js
+// only parses terminal output for the RC signal on sessions with `session.remoteControl`
+// already set (i.e. ones Switchboard itself enabled).
+window.api.onRemoteControlState((sessionId, state) => {
+  sessionRcState.set(sessionId, state);
+  applyRcBadge(sessionId);
+  updateRcHeader(sessionId);
+});
+
+// Inject/update/remove the Remote Control badge on the sidebar item and grid card.
+function applyRcBadge(sessionId) {
+  const state = sessionRcState.get(sessionId);
+  const on = !!(state && state.enabled);
+  const confirmed = on && !!state.url;
+
+  const updateBadge = (el) => {
+    if (!el) return;
+    el.classList.toggle('has-remote-control', on);
+    let badge = el.querySelector('.rc-badge');
+    if (!on) { if (badge) badge.remove(); return; }
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'rc-badge';
+      badge.title = 'Remote Control';
+      badge.textContent = '📱';
+      const target = el.querySelector('.session-summary') || el.querySelector('.grid-card-header') || el;
+      target.appendChild(badge);
+    }
+    badge.classList.toggle('rc-badge-confirmed', confirmed);
+    badge.classList.toggle('rc-badge-pending', !confirmed);
+  };
+
+  document
+    .querySelectorAll(`.session-item[data-session-id="${sessionId}"]`)
+    .forEach(updateBadge);
+  updateBadge(gridCards.get(sessionId));
+}
 
 // --- Single entry point for all sidebar renders ---
 // resort=true: re-sort items by priority+time (use for user-initiated actions)
@@ -529,6 +664,20 @@ terminalStopBtn.addEventListener('click', () => {
   if (activeSessionId) confirmAndStopSession(activeSessionId);
 });
 
+if (terminalHeaderRcBtn) {
+  terminalHeaderRcBtn.addEventListener('click', async () => {
+    if (!activeSessionId) return;
+    terminalHeaderRcBtn.disabled = true;
+    const res = await window.api.toggleRemoteControl(activeSessionId);
+    terminalHeaderRcBtn.disabled = false;
+    if (!res || !res.ok) {
+      const msg = (res && res.error) || 'Could not toggle Remote Control';
+      console.warn('[remote-control] ' + msg);
+      terminalHeaderRcBtn.title = msg;
+    }
+  });
+}
+
 
 // --- Poll for active PTY sessions ---
 async function pollActiveSessions() {
@@ -571,6 +720,9 @@ function updateRunningIndicators() {
     const stopBtn = card.querySelector('.grid-card-stop-btn');
     if (stopBtn) stopBtn.style.display = running ? '' : 'none';
   }
+  // Re-apply Remote Control badges — sidebar items and grid cards are rebuilt
+  // on refresh, which wipes any badge DOM children injected by applyRcBadge.
+  sessionRcState.forEach((_state, sid) => applyRcBadge(sid));
 }
 
 function updateTerminalHeader() {

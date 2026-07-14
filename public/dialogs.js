@@ -256,6 +256,8 @@ async function launchRemoteSession(host, opts) {
     permissionMode: options.permissionMode,
     addDirs: options.addDirs,
     preLaunchCmd: options.preLaunchCmd || null,
+    remoteControl: options.remoteControl,
+    remoteControlName: options.remoteControlName,
   });
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);
@@ -315,6 +317,16 @@ async function showNewSessionDialog(project) {
     <div class="settings-field">
       <div class="settings-label">Permission Mode</div>
       <div class="permission-grid" id="nsd-mode-grid">${renderModeGrid()}</div>
+    </div>
+    <div class="settings-field">
+      <div class="settings-field-info">
+        <span class="settings-label">Remote Control</span>
+        <div class="settings-description">Control this session from your phone (claude.ai / mobile app)</div>
+      </div>
+      <div class="settings-field-control">
+        <input type="text" class="settings-input" id="nsd-remote-control-name" placeholder="name (optional)" value="" style="width:140px">
+        <label class="settings-toggle"><input type="checkbox" id="nsd-remote-control"><span class="settings-toggle-slider"></span></label>
+      </div>
     </div>
     <div id="nsd-local-only">
       <div class="settings-field">
@@ -407,6 +419,11 @@ async function showNewSessionDialog(project) {
     if (dangerousSkip) options.dangerouslySkipPermissions = true;
     else if (selectedMode) options.permissionMode = selectedMode;
     options.addDirs = dialog.querySelector('#nsd-add-dirs').value.trim();
+    if (dialog.querySelector('#nsd-remote-control').checked) {
+      options.remoteControl = true;
+      const rcName = dialog.querySelector('#nsd-remote-control-name').value.trim();
+      if (rcName) options.remoteControlName = rcName;
+    }
     return options;
   }
 

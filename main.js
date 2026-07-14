@@ -30,6 +30,7 @@ const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslS
 const remoteHosts = require('./remote-hosts');
 const remoteIndex = require('./remote-index');
 const remoteIde = require('./remote-ide');
+const remoteControl = require('./remote-control');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
@@ -1234,6 +1235,32 @@ function teardownRemoteIdeTunnel(host, sock, remotePort, localPort, log) {
   try { cp.spawnSync('ssh', remoteIde.remoteLockCleanupArgs(host, sock, remotePort), { timeout: 8000 }); } catch {}
 }
 
+// Update + broadcast a session's Remote Control state. When enabling, arm a
+// timer: if no session URL is observed shortly, the mode did not actually start
+// (old CLI / wrong plan / non-anthropic base URL), so revert to off+unavailable.
+const RC_CONFIRM_MS = 8000;
+function setRemoteControlState(session, sessionId, patch, armTimer) {
+  if (!session) return;
+  session.remoteControl = Object.assign(
+    { enabled: false, name: null, url: null, unavailable: false },
+    session.remoteControl || {},
+    patch
+  );
+  if (session._rcTimer) { clearTimeout(session._rcTimer); session._rcTimer = null; }
+  if (armTimer) {
+    session._rcTimer = setTimeout(() => {
+      session._rcTimer = null;
+      if (session.remoteControl && session.remoteControl.enabled && !session.remoteControl.url) {
+        setRemoteControlState(session, session.realSessionId || sessionId, { enabled: false, unavailable: true });
+      }
+    }, RC_CONFIRM_MS);
+    if (session._rcTimer.unref) session._rcTimer.unref();
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('remote-control-state', sessionId, session.remoteControl);
+  }
+}
+
 // --- IPC: open-terminal ---
 ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions) => {
   if (!mainWindow) return { ok: false, error: 'no window' };
@@ -1402,6 +1429,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         } else if (sessionOptions?.resume) {
           cc += ` --resume "${sessionOptions.resume}"`;
         }
+        if (sessionOptions?.remoteControl) {
+          cc += ' ' + remoteControl.remoteControlArgs(sessionOptions.remoteControlName);
+        }
         if (ideInfo) cc += ' --ide';
         // Pre-launch command wraps the claude invocation (same as local:
         // "<preLaunch> claude …", e.g. "aws-vault exec profile -- claude …").
@@ -1478,6 +1508,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
             claudeCmd += ` --add-dir "${dir}"`;
           }
         }
+        if (sessionOptions.remoteControl) {
+          claudeCmd += ' ' + remoteControl.remoteControlArgs(sessionOptions.remoteControlName);
+        }
       }
 
       if (sessionOptions?.appendSystemPrompt) {
@@ -1546,8 +1579,23 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   };
   activeSessions.set(sessionId, session);
 
+  if (sessionOptions?.remoteControl) {
+    setRemoteControlState(session, sessionId, {
+      enabled: true,
+      name: sessionOptions.remoteControlName || null,
+    }, true /* armTimer */);
+  }
+
   ptyProcess.onData(data => {
     const currentId = session.realSessionId || sessionId;
+
+    // Remote Control: capture the session URL to confirm the mode is active.
+    if (session.remoteControl && data.includes('claude.ai/code/')) {
+      const sig = remoteControl.parseRemoteControlSignal(data);
+      if (sig.url && session.remoteControl.url !== sig.url) {
+        setRemoteControlState(session, currentId, { enabled: true, url: sig.url, unavailable: false });
+      }
+    }
 
     // Parse OSC sequences (title changes, progress, notifications, etc.)
     if (data.includes('\x1b]')) {
@@ -1660,6 +1708,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         mainWindow.webContents.send('process-exited', sessionId, exitCode);
       }
     }
+    if (session._rcTimer) { clearTimeout(session._rcTimer); session._rcTimer = null; }
+
     activeSessions.delete(realId);
     // Clean up the original key too in case transition detection hasn't run yet
     activeSessions.delete(sessionId);
@@ -1685,6 +1735,28 @@ ipcMain.on('terminal-input', (_event, sessionId, data) => {
   if (session && !session.exited) {
     session.pty.write(data);
   }
+});
+
+// --- IPC: toggle Remote Control on a running session ---
+ipcMain.handle('session:toggle-remote-control', (_event, sessionId) => {
+  const session = activeSessions.get(sessionId);
+  if (!session || session.exited) return { ok: false, error: 'session not running' };
+  const isClaudeSession = !session.isPlainTerminal || (session.remote && session.remoteMode === 'claude');
+  if (!isClaudeSession) return { ok: false, error: 'not a Claude session' };
+  if (session._cliBusy) return { ok: false, error: 'Claude is busy — wait until it is idle' };
+
+  const willEnable = !(session.remoteControl && session.remoteControl.enabled);
+  try {
+    session.pty.write(remoteControl.remoteControlToggleInput());
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+  setRemoteControlState(session, sessionId, {
+    enabled: willEnable,
+    url: null,
+    unavailable: false,
+  }, willEnable /* armTimer */);
+  return { ok: true, enabling: willEnable };
 });
 
 // --- IPC: terminal-resize (fire-and-forget) ---
