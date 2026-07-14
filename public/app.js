@@ -261,6 +261,12 @@ window.api.onSessionForked((oldId, newId) => {
   sessionMap.delete(oldId);
   sessionMap.set(newId, entry.session);
 
+  if (sessionRcState.has(oldId)) { sessionRcState.set(newId, sessionRcState.get(oldId)); sessionRcState.delete(oldId); }
+  sessionRcPopoverShown.delete(oldId);
+  if (rcPopoverSessionId === oldId) rcPopoverSessionId = newId;
+  applyRcBadge(newId);
+  if (activeSessionId === newId) updateRcHeader(newId);
+
   terminalHeaderId.textContent = newId;
 
   loadProjects().then(() => {
@@ -280,6 +286,13 @@ window.api.onProcessExited((sessionId, exitCode) => {
   const session = sessionMap.get(sessionId);
   if (entry) {
     entry.closed = true;
+  }
+
+  if (sessionRcState.has(sessionId)) {
+    sessionRcState.delete(sessionId);
+    sessionRcPopoverShown.delete(sessionId);
+    applyRcBadge(sessionId);
+    if (sessionId === activeSessionId) updateRcHeader(sessionId);
   }
 
   // Clean up terminal UI on exit (uses destroySession to handle grid cards too)
@@ -360,7 +373,8 @@ function updateRcHeader(sessionId) {
   if (!terminalHeaderRcBtn) return;
   if (sessionId && sessionId !== activeSessionId) return;
   const entry = activeSessionId ? openSessions.get(activeSessionId) : null;
-  const isClaude = !!entry && entry.session?.type !== 'terminal';
+  const s = entry?.session;
+  const isClaude = !!entry && (s?.type !== 'terminal' || s?.remoteMode === 'claude');
   terminalHeaderRcBtn.style.display = isClaude ? '' : 'none';
   if (!isClaude) { hideRcPopover(); return; }
   const state = sessionRcState.get(activeSessionId);
@@ -424,6 +438,11 @@ if (rcOpenBtn) rcOpenBtn.addEventListener('click', () => {
 
 if (rcPopoverClose) rcPopoverClose.addEventListener('click', () => hideRcPopover());
 
+// Note: Remote Control toggled manually *inside* the terminal (e.g. the user types
+// the toggle shortcut themselves on a session Switchboard didn't launch with the
+// flag or toggle via its own button) is intentionally not detected here — main.js
+// only parses terminal output for the RC signal on sessions with `session.remoteControl`
+// already set (i.e. ones Switchboard itself enabled).
 window.api.onRemoteControlState((sessionId, state) => {
   sessionRcState.set(sessionId, state);
   applyRcBadge(sessionId);
