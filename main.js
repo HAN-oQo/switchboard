@@ -1737,6 +1737,27 @@ ipcMain.on('terminal-input', (_event, sessionId, data) => {
   }
 });
 
+// --- IPC: toggle Remote Control on a running session ---
+ipcMain.handle('session:toggle-remote-control', (_event, sessionId) => {
+  const session = activeSessions.get(sessionId);
+  if (!session || session.exited) return { ok: false, error: 'session not running' };
+  if (session.isPlainTerminal) return { ok: false, error: 'not a Claude session' };
+  if (session._cliBusy) return { ok: false, error: 'Claude is busy — wait until it is idle' };
+
+  const willEnable = !(session.remoteControl && session.remoteControl.enabled);
+  try {
+    session.pty.write(remoteControl.remoteControlToggleInput());
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+  setRemoteControlState(session, sessionId, {
+    enabled: willEnable,
+    url: willEnable ? null : null,
+    unavailable: false,
+  }, willEnable /* armTimer */);
+  return { ok: true, enabling: willEnable };
+});
+
 // --- IPC: terminal-resize (fire-and-forget) ---
 ipcMain.on('terminal-resize', (_event, sessionId, cols, rows) => {
   const session = activeSessions.get(sessionId);
