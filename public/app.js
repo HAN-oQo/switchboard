@@ -121,6 +121,7 @@ const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 const lastActivityTime = new Map(); // sessionId → Date of last terminal output
 const sessionRcState = new Map(); // sessionId → { enabled, url, name, unavailable }
 const sessionRcPopoverShown = new Map(); // sessionId → boolean, whether the popover auto-opened for the current "on" streak
+let rcPopoverSessionId = null; // sessionId the popover is currently showing a URL for, if visible
 
 // Noise patterns — these don't count as activity
 const activityNoiseRe = /file-history-snapshot|^\s*$/;
@@ -378,6 +379,9 @@ function updateRcHeader(sessionId) {
   // session switch); hide it whenever RC is off/pending, or the active
   // session isn't a confirmed one.
   if (!on) sessionRcPopoverShown.delete(activeSessionId);
+  if (rcPopover && rcPopover.style.display !== 'none' && rcPopoverSessionId !== activeSessionId) {
+    hideRcPopover();
+  }
   if (confirmed) {
     if (!sessionRcPopoverShown.get(activeSessionId)) {
       sessionRcPopoverShown.set(activeSessionId, true);
@@ -397,6 +401,7 @@ function showRcPopover() {
   const state = sessionRcState.get(activeSessionId);
   if (!state || !state.url) { hideRcPopover(); return; }
   if (rcPopoverUrl) rcPopoverUrl.textContent = state.url;
+  rcPopoverSessionId = activeSessionId;
   if (rcPopover) rcPopover.style.display = '';
 }
 
