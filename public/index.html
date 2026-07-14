@@ -79,6 +79,17 @@
         <div id="terminal-header-controls">
           <span id="terminal-header-status"></span>
           <button id="terminal-header-rc-btn" title="Toggle Remote Control" style="display:none;">📱</button>
+          <div id="rc-popover" style="display:none;">
+            <div id="rc-popover-header">
+              <span id="rc-popover-title">Remote Control</span>
+              <button id="rc-popover-close" type="button" title="Close">×</button>
+            </div>
+            <div id="rc-popover-url"></div>
+            <div id="rc-popover-actions">
+              <button id="rc-copy-btn" type="button">Copy link</button>
+              <button id="rc-open-btn" type="button">Open</button>
+            </div>
+          </div>
           <button id="terminal-stop-btn" title="Stop process"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="2" width="8" height="8" rx="1"/></svg></button>
         </div>
       </div>

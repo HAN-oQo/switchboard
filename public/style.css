@@ -1158,6 +1158,7 @@ body { display: flex; flex-direction: column; }
 }
 
 #terminal-header-controls {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1239,6 +1240,83 @@ body { display: flex; flex-direction: column; }
 #terminal-header-rc-btn.rc-on { color: #2ea043; filter: none; }
 #terminal-header-rc-btn.rc-pending { color: #d29922; filter: none; animation: rc-pulse 1.2s ease-in-out infinite; }
 #terminal-header-rc-btn:disabled { opacity: 0.4; cursor: default; }
+
+#rc-popover {
+  position: absolute;
+  z-index: 40;
+  right: 8px;
+  top: 40px;
+  background: #1e1e2a;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  padding: 10px;
+  min-width: 220px;
+  max-width: 280px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+
+#rc-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+#rc-popover-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #d0d0e8;
+}
+
+#rc-popover-close {
+  background: none;
+  border: none;
+  color: #7a7a90;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: all 0.15s;
+}
+
+#rc-popover-close:hover {
+  background: rgba(255,255,255,0.08);
+  color: #d0d0e8;
+}
+
+#rc-popover-url {
+  font-size: 11px;
+  font-family: 'SF Mono', 'Fira Code', Menlo, monospace;
+  color: #b0b0c4;
+  word-break: break-all;
+  opacity: 0.85;
+  margin-bottom: 8px;
+}
+
+#rc-popover-actions {
+  display: flex;
+  gap: 6px;
+}
+
+#rc-popover-actions button {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.06);
+  color: #b0b0c4;
+  transition: all 0.15s;
+}
+
+#rc-popover-actions button:hover {
+  background: rgba(255,255,255,0.1);
+  color: #d0d0e8;
+}
 
 #terminals {
   flex: 1;

@@ -14,6 +14,11 @@ const terminalHeaderStatus = document.getElementById('terminal-header-status');
 const terminalHeaderShell = document.getElementById('terminal-header-shell');
 const terminalStopBtn = document.getElementById('terminal-stop-btn');
 const terminalHeaderRcBtn = document.getElementById('terminal-header-rc-btn');
+const rcPopover = document.getElementById('rc-popover');
+const rcPopoverUrl = document.getElementById('rc-popover-url');
+const rcCopyBtn = document.getElementById('rc-copy-btn');
+const rcOpenBtn = document.getElementById('rc-open-btn');
+const rcPopoverClose = document.getElementById('rc-popover-close');
 const runningToggle = document.getElementById('running-toggle');
 const todayToggle = document.getElementById('today-toggle');
 const planViewer = document.getElementById('plan-viewer');
@@ -115,6 +120,7 @@ const responseReadySessions = new Set(); // Claude finished, user hasn't looked 
 const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 const lastActivityTime = new Map(); // sessionId → Date of last terminal output
 const sessionRcState = new Map(); // sessionId → { enabled, url, name, unavailable }
+const sessionRcPopoverShown = new Map(); // sessionId → boolean, whether the popover auto-opened for the current "on" streak
 
 // Noise patterns — these don't count as activity
 const activityNoiseRe = /file-history-snapshot|^\s*$/;
@@ -355,7 +361,7 @@ function updateRcHeader(sessionId) {
   const entry = activeSessionId ? openSessions.get(activeSessionId) : null;
   const isClaude = !!entry && entry.session?.type !== 'terminal';
   terminalHeaderRcBtn.style.display = isClaude ? '' : 'none';
-  if (!isClaude) return;
+  if (!isClaude) { hideRcPopover(); return; }
   const state = sessionRcState.get(activeSessionId);
   const on = !!(state && state.enabled);
   const confirmed = on && !!state.url;
@@ -366,7 +372,52 @@ function updateRcHeader(sessionId) {
   terminalHeaderRcBtn.title = busy
     ? 'Wait until Claude is idle to toggle Remote Control'
     : (on ? 'Remote Control ON — click to turn off' : 'Turn on Remote Control');
+
+  // Auto-open the popover the instant this session's URL is first confirmed
+  // (guarded so it fires once per "on" streak, not on every state event or
+  // session switch); hide it whenever RC is off/pending, or the active
+  // session isn't a confirmed one.
+  if (!on) sessionRcPopoverShown.delete(activeSessionId);
+  if (confirmed) {
+    if (!sessionRcPopoverShown.get(activeSessionId)) {
+      sessionRcPopoverShown.set(activeSessionId, true);
+      showRcPopover();
+    }
+  } else {
+    hideRcPopover();
+  }
 }
+
+// --- Remote Control popover (copy link / open in browser) ---
+function hideRcPopover() {
+  if (rcPopover) rcPopover.style.display = 'none';
+}
+
+function showRcPopover() {
+  const state = sessionRcState.get(activeSessionId);
+  if (!state || !state.url) { hideRcPopover(); return; }
+  if (rcPopoverUrl) rcPopoverUrl.textContent = state.url;
+  if (rcPopover) rcPopover.style.display = '';
+}
+
+if (rcCopyBtn) rcCopyBtn.addEventListener('click', () => {
+  const state = sessionRcState.get(activeSessionId);
+  if (!state || !state.url) return;
+  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+    console.warn('[remote-control] clipboard API unavailable');
+    return;
+  }
+  navigator.clipboard.writeText(state.url).catch((err) => {
+    console.warn('[remote-control] failed to copy link', err);
+  });
+});
+
+if (rcOpenBtn) rcOpenBtn.addEventListener('click', () => {
+  const state = sessionRcState.get(activeSessionId);
+  if (state && state.url) window.api.openExternal(state.url);
+});
+
+if (rcPopoverClose) rcPopoverClose.addEventListener('click', () => hideRcPopover());
 
 window.api.onRemoteControlState((sessionId, state) => {
   sessionRcState.set(sessionId, state);
