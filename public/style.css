@@ -1216,6 +1216,30 @@ body { display: flex; flex-direction: column; }
   background: rgba(224,80,112,0.1);
 }
 
+#terminal-header-rc-btn {
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 4px;
+  line-height: 1;
+  font-size: 13px;
+  color: #7a7a90;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  filter: grayscale(1) opacity(0.7);
+}
+
+#terminal-header-rc-btn:hover {
+  background: rgba(255,255,255,0.08);
+}
+
+#terminal-header-rc-btn.rc-on { color: #2ea043; filter: none; }
+#terminal-header-rc-btn.rc-pending { color: #d29922; filter: none; animation: rc-pulse 1.2s ease-in-out infinite; }
+#terminal-header-rc-btn:disabled { opacity: 0.4; cursor: default; }
+
 #terminals {
   flex: 1;
   position: relative;
