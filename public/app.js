@@ -112,6 +112,7 @@ const attentionSessions = new Set(); // sessions needing user action (OSC 9)
 const responseReadySessions = new Set(); // Claude finished, user hasn't looked (terminal state)
 const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 const lastActivityTime = new Map(); // sessionId → Date of last terminal output
+const sessionRcState = new Map(); // sessionId → { enabled, url, name, unavailable }
 
 // Noise patterns — these don't count as activity
 const activityNoiseRe = /file-history-snapshot|^\s*$/;
@@ -343,6 +344,45 @@ window.api.onCliBusyState((sessionId, busy) => {
   setActivity(sessionId, busy);
 });
 
+// --- Remote Control badge (sidebar + grid overview) ---
+// TODO(Task 7): replace this stub with the real header implementation.
+function updateRcHeader() {}
+
+window.api.onRemoteControlState((sessionId, state) => {
+  sessionRcState.set(sessionId, state);
+  applyRcBadge(sessionId);
+  updateRcHeader(sessionId); // defined in Task 7; safe no-op stub until then
+});
+
+// Inject/update/remove the Remote Control badge on the sidebar item and grid card.
+function applyRcBadge(sessionId) {
+  const state = sessionRcState.get(sessionId);
+  const on = !!(state && state.enabled);
+  const confirmed = on && !!state.url;
+
+  const updateBadge = (el) => {
+    if (!el) return;
+    el.classList.toggle('has-remote-control', on);
+    let badge = el.querySelector('.rc-badge');
+    if (!on) { if (badge) badge.remove(); return; }
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'rc-badge';
+      badge.title = 'Remote Control';
+      badge.textContent = '📱';
+      const target = el.querySelector('.session-name') || el.querySelector('.grid-card-header') || el;
+      target.appendChild(badge);
+    }
+    badge.classList.toggle('rc-badge-confirmed', confirmed);
+    badge.classList.toggle('rc-badge-pending', !confirmed);
+  };
+
+  document
+    .querySelectorAll(`.session-item[data-session-id="${sessionId}"]`)
+    .forEach(updateBadge);
+  updateBadge(gridCards.get(sessionId));
+}
+
 // --- Single entry point for all sidebar renders ---
 // resort=true: re-sort items by priority+time (use for user-initiated actions)
 // resort=false (default): preserve existing DOM order, new items go to top
@@ -571,6 +611,9 @@ function updateRunningIndicators() {
     const stopBtn = card.querySelector('.grid-card-stop-btn');
     if (stopBtn) stopBtn.style.display = running ? '' : 'none';
   }
+  // Re-apply Remote Control badges — sidebar items and grid cards are rebuilt
+  // on refresh, which wipes any badge DOM children injected by applyRcBadge.
+  sessionRcState.forEach((_state, sid) => applyRcBadge(sid));
 }
 
 function updateTerminalHeader() {
