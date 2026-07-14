@@ -126,6 +126,18 @@ test('buildRemoteCommand (claude) skips cd for home and cds otherwise', () => {
   assert.equal(buildRemoteCommand('claude', '~/work', 'claude'), "cd $HOME/'work' && exec claude");
 });
 
+test('buildRemoteCommand (claude) injects a preExec snippet between cd and exec', () => {
+  assert.equal(
+    buildRemoteCommand('claude', '/proj', 'claude --ide', 'export X=1'),
+    "cd '/proj' && export X=1 && exec claude --ide"
+  );
+  // home dir: no cd, but preExec still runs before exec
+  assert.equal(
+    buildRemoteCommand('claude', '~', 'claude --ide', 'export X=1'),
+    'export X=1 && exec claude --ide'
+  );
+});
+
 test('buildRemoteCommand (shell) execs the login shell, tolerating a failed cd', () => {
   assert.equal(buildRemoteCommand('shell', '~', null), 'exec "${SHELL:-bash}" -l');
   assert.equal(

@@ -29,6 +29,7 @@ const cleanPtyEnv = Object.fromEntries(
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, isSshProfile } = require('./shell-profiles');
 const remoteHosts = require('./remote-hosts');
 const remoteIndex = require('./remote-index');
+const remoteIde = require('./remote-ide');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
@@ -1086,6 +1087,9 @@ const SETTING_DEFAULTS = {
   terminalTheme: 'switchboard',
   mcpEmulation: false,
   shellProfile: 'auto',
+  // Phase 3: IDE integration for REMOTE sessions (reverse-forward the local IDE
+  // over SSH). Off by default — it exposes the local IDE port on the remote host.
+  remoteIde: false,
 };
 
 ipcMain.handle('get-shell-profiles', () => {
@@ -1190,6 +1194,45 @@ ipcMain.handle('archive-session', (_event, sessionId, archived) => {
   setArchived(sessionId, val);
   return { archived: val };
 });
+
+// Phase 3: set up IDE-over-SSH for a remote claude session. Starts the local IDE
+// MCP server (with a reader that cats old-file content over SSH), brings up the
+// control master, and reverse-forwards the local port to a free remote port.
+// Returns { mcpServer, remotePort, sock } or null (IDE skipped — session still runs).
+function setupRemoteIdeTunnel(sessionId, host, sock, remoteDir, mainWindow, log) {
+  const cp = require('child_process');
+  // Ensure the control master is live (creates it if needed) before -O forward.
+  try {
+    const probe = cp.spawnSync('ssh', remoteIndex.sshCmdArgs(host, sock, 'true'), { timeout: 9000 });
+    if (probe.status !== 0) { log.info('[remote-ide] master probe failed — skipping IDE'); return Promise.resolve(null); }
+  } catch (e) { log.info('[remote-ide] master probe error — skipping IDE: ' + e.message); return Promise.resolve(null); }
+
+  // Old-file reader: cat the file on the remote host over the shared socket (sync;
+  // used by openDiff/openFile which call it synchronously).
+  const readOldFile = (p) => cp.execFileSync('ssh', remoteIde.remoteCatArgs(host, sock, p),
+    { encoding: 'utf8', timeout: 12000, maxBuffer: 32 * 1024 * 1024 });
+
+  return startMcpServer(sessionId, [remoteDir], mainWindow, log, { readOldFile }).then((mcpServer) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const remotePort = remoteIde.candidateRemotePort(mcpServer.port, attempt);
+      const fwd = cp.spawnSync('ssh', remoteIde.reverseForwardArgs(host, sock, remotePort, mcpServer.port), { timeout: 9000 });
+      if (fwd.status === 0) {
+        log.info(`[remote-ide] session=${sessionId} tunnel remote:${remotePort} -> local:${mcpServer.port}`);
+        return { mcpServer, remotePort, sock };
+      }
+    }
+    log.info('[remote-ide] could not allocate a remote forward port — skipping IDE');
+    try { shutdownMcpServer(sessionId); } catch {}
+    return null;
+  }).catch((e) => { log.info('[remote-ide] setup failed: ' + e.message); return null; });
+}
+
+// Tear down a remote IDE tunnel: cancel the reverse forward + remove the remote lock.
+function teardownRemoteIdeTunnel(host, sock, remotePort, localPort, log) {
+  const cp = require('child_process');
+  try { cp.spawnSync('ssh', remoteIde.cancelForwardArgs(host, sock, remotePort, localPort), { timeout: 8000 }); } catch {}
+  try { cp.spawnSync('ssh', remoteIde.remoteLockCleanupArgs(host, sock, remotePort), { timeout: 8000 }); } catch {}
+}
 
 // --- IPC: open-terminal ---
 ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions) => {
@@ -1311,12 +1354,35 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
   let ptyProcess;
   let mcpServer = null;
+  let ideInfo = null; // Phase 3 remote-IDE tunnel info (outer scope for teardown)
   try {
     if (isRemote) {
       // Remote (SSH) session: run Claude (or a login shell) on the remote host.
-      // No claude shim and no IDE/MCP emulation — the MCP socket is local and
-      // the CLI on the remote can't reach it (IDE over SSH is a later phase).
+      // No claude shim. IDE/MCP emulation is opt-in (Phase 3): when enabled we
+      // reverse-forward the local IDE port so the remote CLI can reach it.
       const remoteMode = sessionOptions?.remoteMode === 'shell' ? 'shell' : 'claude';
+      const remoteDir = sessionOptions?.remoteDir || '~';
+
+      // Resolve the effective IDE-over-SSH setting: global default, overridden per
+      // remote project (the gear on a remote project writes project:ssh://... ).
+      let remoteIdeEnabled = false;
+      if (remoteMode === 'claude') {
+        const g = getSetting('global') || {};
+        const proj = getSetting('project:' + projectPath) || {};
+        remoteIdeEnabled = (g.remoteIde !== undefined && g.remoteIde !== null) ? !!g.remoteIde : !!SETTING_DEFAULTS.remoteIde;
+        if (proj.remoteIde !== undefined && proj.remoteIde !== null) remoteIdeEnabled = !!proj.remoteIde;
+      }
+
+      let idePreExec = '';
+      if (remoteIdeEnabled) {
+        const sock = remoteHosts.controlSocketPath(os.tmpdir(), remoteHost.id);
+        ideInfo = await setupRemoteIdeTunnel(sessionId, remoteHost, sock, remoteDir, mainWindow, log);
+        if (ideInfo) {
+          mcpServer = ideInfo.mcpServer;
+          idePreExec = remoteIde.remoteIdeLockScript(ideInfo.remotePort, ideInfo.mcpServer.authToken);
+        }
+      }
+
       let innerCmd = null;
       if (remoteMode === 'claude') {
         let cc = 'claude';
@@ -1336,9 +1402,10 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         } else if (sessionOptions?.resume) {
           cc += ` --resume "${sessionOptions.resume}"`;
         }
+        if (ideInfo) cc += ' --ide';
         innerCmd = cc;
       }
-      const remoteCmd = remoteHosts.buildRemoteCommand(remoteMode, sessionOptions?.remoteDir || '~', innerCmd);
+      const remoteCmd = remoteHosts.buildRemoteCommand(remoteMode, remoteDir, innerCmd, idePreExec);
       ptyProcess = pty.spawn(shell, shellArgs(shell, remoteCmd, shellExtraArgs), {
         name: 'xterm-256color',
         cols: 120,
@@ -1469,6 +1536,10 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     remoteMode: isRemote ? (sessionOptions?.remoteMode === 'shell' ? 'shell' : 'claude') : null,
     forkFrom: sessionOptions?.forkFrom || null,
     mcpServer, _openedAt: Date.now(),
+    // Phase 3: remote IDE reverse-tunnel teardown info (present only when enabled).
+    remoteIde: (isRemote && ideInfo)
+      ? { remotePort: ideInfo.remotePort, localPort: ideInfo.mcpServer.port, sock: ideInfo.sock }
+      : null,
   };
   activeSessions.set(sessionId, session);
 
@@ -1568,6 +1639,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     const mcpId = session.realSessionId || sessionId;
     shutdownMcpServer(mcpId);
     session.mcpServer = null;
+
+    // Phase 3: tear down the remote IDE reverse-tunnel + remote lock file.
+    if (session.remoteIde && session.remoteHost) {
+      const { remotePort, localPort, sock } = session.remoteIde;
+      try { teardownRemoteIdeTunnel(session.remoteHost, sock, remotePort, localPort, log); } catch {}
+      session.remoteIde = null;
+    }
 
     const realId = session.realSessionId || sessionId;
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1739,6 +1817,8 @@ app.whenReady().then(() => {
   // Index already-reachable remote hosts in the background (Phase 2), so past
   // remote sessions show up on launch without a manual connect/refresh.
   setTimeout(() => { try { startupRemoteSync(); } catch {} }, 2000);
+  // Remove our own stale IDE lock files left by a previous crash (Phase 3).
+  try { cleanStaleLockFiles(log); } catch {}
 
   // Shared runCommand for both cron scheduler and manual "run now"
   const { spawn: cpSpawn } = require('child_process');

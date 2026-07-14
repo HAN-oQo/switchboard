@@ -73,15 +73,18 @@ function quoteRemoteDir(dir) {
 //   mode 'claude': cd <dir> && exec <innerCmd>   (cd failure aborts — don't run in the wrong place)
 //   mode 'shell' : cd <dir> 2>/dev/null; exec login-shell   (cd is best-effort)
 // A home/empty dir needs no cd (a login shell already starts in $HOME).
-function buildRemoteCommand(mode, remoteDir, innerCmd) {
+function buildRemoteCommand(mode, remoteDir, innerCmd, preExec) {
   const hasDir = remoteDir && remoteDir !== '~' && String(remoteDir).trim() !== '';
   const cd = hasDir ? 'cd ' + quoteRemoteDir(remoteDir) : '';
   if (mode === 'shell') {
     const shellExec = 'exec "${SHELL:-bash}" -l';
     return cd ? cd + ' 2>/dev/null; ' + shellExec : shellExec;
   }
-  const inner = 'exec ' + innerCmd;
-  return cd ? cd + ' && ' + inner : inner;
+  // Optional preExec runs after cd, before exec (Phase 3 uses it to write the IDE
+  // lock file so $PWD is the project dir). Chained with && so a failure aborts.
+  const pre = preExec && String(preExec).trim() ? String(preExec).trim() : '';
+  const parts = [cd, pre, 'exec ' + innerCmd].filter(Boolean);
+  return parts.join(' && ');
 }
 
 // The ssh options+target for a host, WITHOUT the -t PTY flag or -o test options.
