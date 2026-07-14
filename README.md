@@ -6,6 +6,17 @@ Switchboard is a desktop app that gives you a unified view of all your Claude Co
 
 ![Switchboard](build/screenshot.png)
 
+## Differences from upstream
+
+This is a fork of [doctly/switchboard](https://github.com/doctly/switchboard) with the following additions that aren't in upstream (yet):
+
+- **Remote SSH sessions** — Add remote hosts (from your `~/.ssh/config` or entered manually) and run Claude Code on them over SSH, right alongside your local sessions. Past remote sessions are indexed so you can search and resume them too, and IDE emulation works over SSH: a remote session's file diffs and opens are reverse-tunneled back into Switchboard's local side panel. *(upstream PR [#78](https://github.com/doctly/switchboard/pull/78))*
+- **Remote Control** — Toggle Claude Code's native Remote Control per session — either with a checkbox when starting a session or a 📱 button on a running one. A badge marks which sessions are remote-controlled, and the session link is captured so you can copy it or open it on your phone. Switchboard adds no networking of its own; it just drives Claude Code's built-in `/remote-control`. *(requires a Claude Pro/Max/Team/Enterprise login on `api.anthropic.com`)*
+- **Korean IME fix** — Space is no longer hijacked during IME composition, so Korean (and other IME) input works correctly in the terminal. *(upstream PR [#75](https://github.com/doctly/switchboard/pull/75))*
+- **Redesigned macOS app icon** — A Session Grid mark.
+
+Everything below is the shared Switchboard feature set, inherited from upstream.
+
 ### Key Features
 
 - **Session Browser** — All your Claude Code sessions, organized by project, searchable by content
