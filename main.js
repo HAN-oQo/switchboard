@@ -30,6 +30,7 @@ const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslS
 const remoteHosts = require('./remote-hosts');
 const remoteIndex = require('./remote-index');
 const remoteIde = require('./remote-ide');
+const remoteControl = require('./remote-control');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
@@ -1402,6 +1403,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         } else if (sessionOptions?.resume) {
           cc += ` --resume "${sessionOptions.resume}"`;
         }
+        if (sessionOptions?.remoteControl) {
+          cc += ' ' + remoteControl.remoteControlArgs(sessionOptions.remoteControlName);
+        }
         if (ideInfo) cc += ' --ide';
         // Pre-launch command wraps the claude invocation (same as local:
         // "<preLaunch> claude …", e.g. "aws-vault exec profile -- claude …").
@@ -1477,6 +1481,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
           for (const dir of dirs) {
             claudeCmd += ` --add-dir "${dir}"`;
           }
+        }
+        if (sessionOptions.remoteControl) {
+          claudeCmd += ' ' + remoteControl.remoteControlArgs(sessionOptions.remoteControlName);
         }
       }
 
