@@ -370,7 +370,7 @@ function applyRcBadge(sessionId) {
       badge.className = 'rc-badge';
       badge.title = 'Remote Control';
       badge.textContent = '📱';
-      const target = el.querySelector('.session-name') || el.querySelector('.grid-card-header') || el;
+      const target = el.querySelector('.session-summary') || el.querySelector('.grid-card-header') || el;
       target.appendChild(badge);
     }
     badge.classList.toggle('rc-badge-confirmed', confirmed);
