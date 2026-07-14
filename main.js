@@ -1251,7 +1251,7 @@ function setRemoteControlState(session, sessionId, patch, armTimer) {
     session._rcTimer = setTimeout(() => {
       session._rcTimer = null;
       if (session.remoteControl && session.remoteControl.enabled && !session.remoteControl.url) {
-        setRemoteControlState(session, sessionId, { enabled: false, unavailable: true });
+        setRemoteControlState(session, session.realSessionId || sessionId, { enabled: false, unavailable: true });
       }
     }, RC_CONFIRM_MS);
     if (session._rcTimer.unref) session._rcTimer.unref();
@@ -1590,7 +1590,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     const currentId = session.realSessionId || sessionId;
 
     // Remote Control: capture the session URL to confirm the mode is active.
-    if (data.includes('claude.ai/code/')) {
+    if (session.remoteControl && data.includes('claude.ai/code/')) {
       const sig = remoteControl.parseRemoteControlSignal(data);
       if (sig.url && (!session.remoteControl || session.remoteControl.url !== sig.url)) {
         setRemoteControlState(session, currentId, { enabled: true, url: sig.url, unavailable: false });
