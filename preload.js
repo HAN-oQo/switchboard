@@ -56,6 +56,7 @@ contextBridge.exposeInMainWorld('api', {
   sendInput: (id, data) => ipcRenderer.send('terminal-input', id, data),
   resizeTerminal: (id, cols, rows) => ipcRenderer.send('terminal-resize', id, cols, rows),
   closeTerminal: (id) => ipcRenderer.send('close-terminal', id),
+  listPersistentSessions: () => ipcRenderer.invoke('list-persistent-sessions'),
 
   // Listeners (main → renderer)
   onTerminalData: (callback) => {

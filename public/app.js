@@ -1210,6 +1210,35 @@ loadProjects().then(() => {
     const session = sessionMap.get(activeSessionId);
     if (session) openSession(session);
   }
+
+  // Phase 1 (tmux persistence): reattach sessions that were open when the app
+  // quit to the still-live tmux server behind them, and surface still-live
+  // sessions that weren't open as "background" for a sidebar badge. No-ops
+  // (empty open+background) when persistence is off or tmux is unavailable.
+  (async () => {
+    const persisted = await window.api.listPersistentSessions();
+    if (!persisted) return;
+    for (const entry of persisted.open) {
+      const sid = entry.claudeSessionId || entry.handle;
+      const session = sessionMap.get(sid) || {
+        sessionId: sid, projectPath: entry.projectPath,
+        type: entry.mode === 'shell' ? 'terminal' : 'session',
+      };
+      if (!openSessions.has(session.sessionId)) {
+        // sessionOptions.type === 'terminal' is what main.js's open-terminal
+        // handler checks to pick the plain-shell branch (mirrors
+        // launchTerminalSession's { type: 'terminal' }); without it a
+        // shell-mode entry would fall into the Claude-command branch (bogus
+        // claude --resume + a stray MCP server) even though tmux -A ignores
+        // the built command on attach to an already-live session.
+        const opts = { reattachHandle: entry.handle };
+        if (entry.mode === 'shell') opts.type = 'terminal';
+        openSession(session, opts);
+      }
+    }
+    window.__backgroundSessions = new Set(persisted.background.map(e => e.claudeSessionId || e.handle));
+    loadProjects();
+  })();
 });
 
 // Live-reload sidebar when filesystem changes are detected

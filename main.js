@@ -1204,6 +1204,39 @@ ipcMain.handle('stop-session', (_event, sessionId) => {
   return { ok: true };
 });
 
+// Per-handle liveness probe (2026-07-15 amendment: no shared-server `tmux ls`
+// — each session has its own socket, so we probe each stored handle's
+// dedicated server with `has-session` instead of listing one shared server).
+function liveTmuxNames() {
+  if (!tmuxAvailable) return [];
+  const { spawnSync } = require('child_process');
+  const names = [];
+  for (const handle of Object.keys(readPersistStore())) {
+    const name = tmuxSession.sessionName(handle);
+    try {
+      const r = spawnSync('tmux', tmuxSession.hasSessionArgs(name, tmuxSession.socketPath(TMUX_SOCKET_DIR, handle)));
+      if (r.status === 0) names.push(name);
+    } catch {}
+  }
+  return names;
+}
+
+// --- IPC: list-persistent-sessions ---
+// Prunes dead entries against live per-handle probes, then returns the open
+// (wasOpen) and background (live but not open) entries for the renderer's
+// startup reattach + sidebar badge.
+ipcMain.handle('list-persistent-sessions', () => {
+  const live = liveTmuxNames();
+  const store = sessionStore.pruneDead(readPersistStore(), live, tmuxSession.sessionName);
+  writePersistStore(store);
+  const openHandles = new Set(sessionStore.openEntries(store).map(e => e.handle));
+  const withName = (e) => ({ ...e, sessionName: tmuxSession.sessionName(e.handle) });
+  return {
+    open: sessionStore.openEntries(store).map(withName),
+    background: sessionStore.backgroundEntries(store, openHandles).map(withName),
+  };
+});
+
 // --- IPC: toggle-star ---
 ipcMain.handle('toggle-star', (_event, sessionId) => {
   const starred = toggleStar(sessionId);
@@ -1537,6 +1570,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         };
         const r = spawnLocalSession({
           shell, args: shellArgs(shell, undefined, shellExtraArgs), opts: spawnOpts,
+          handle: sessionOptions?.reattachHandle,
         });
         ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle; socketPath = r.socketPath;
       }
@@ -1629,6 +1663,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         };
         const r = spawnLocalSession({
           shell, args: shellArgs(shell, claudeCmd, shellExtraArgs), opts: spawnOpts,
+          handle: sessionOptions?.reattachHandle,
         });
         ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle; socketPath = r.socketPath;
       }
