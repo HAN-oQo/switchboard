@@ -117,6 +117,28 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
         e.preventDefault();
       }
     }, { capture: true });
+
+    // Keep xterm's hidden helper <textarea> from accumulating stale text.
+    // A native paste (Electron Edit menu { role: 'paste' }) inserts the clipboard
+    // text into this textarea, and xterm does not clear it afterwards, so pasted
+    // text plus every IME-composed syllable pile up in the buffer indefinitely.
+    // When a keystroke lands mid-composition, xterm's composition helper re-emits
+    // the WHOLE buffer instead of just the new syllable — injecting stray
+    // characters (e.g. a previously pasted URL) into the PTY. Wipe the buffer once
+    // each paste / composition has been delivered, but never mid-composition
+    // (xterm reads the in-progress syllable from here).
+    let composing = false;
+    const clearHelperTextarea = () => {
+      if (textarea.value === '') return;
+      // Defer so xterm's own paste / compositionend handlers run first and emit
+      // their data before we reset the shared buffer.
+      setTimeout(() => { if (!composing) textarea.value = ''; }, 0);
+    };
+    textarea.addEventListener('compositionstart', () => { composing = true; });
+    textarea.addEventListener('compositionend', () => { composing = false; clearHelperTextarea(); });
+    textarea.addEventListener('input', (e) => {
+      if (e.inputType === 'insertFromPaste' && !composing) clearHelperTextarea();
+    });
   }
 }
 
