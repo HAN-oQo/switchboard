@@ -74,6 +74,7 @@
     const themeValue = fieldValue('terminalTheme', 'switchboard');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
     const remoteIdeValue = fieldValue('remoteIde', false);
+    const persistSessionsValue = fieldValue('persistSessions', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
 
     // Discover available shell profiles
@@ -251,6 +252,16 @@
             <label class="settings-toggle"><input type="checkbox" id="sv-remote-ide" ${remoteIdeValue ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
           </div>
         </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Keep sessions running in the background (tmux)</span>
+            <div class="settings-description">Wrap local sessions in tmux so they keep running after you close the tab or quit Switchboard, and can be reattached later. Requires tmux to be installed. On by default; applies to new sessions.</div>
+          </div>
+          <div class="settings-field-control">
+            <label class="settings-toggle"><input type="checkbox" id="sv-persist-sessions" ${persistSessionsValue ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+          </div>
+        </div>
       </div>` : ''}
 
       ${!isProject ? `<div class="settings-section">
@@ -336,6 +347,8 @@
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
         const remoteIdeCb = settingsViewerBody.querySelector('#sv-remote-ide');
         if (remoteIdeCb) settings.remoteIde = remoteIdeCb.checked;
+        const persistCb = settingsViewerBody.querySelector('#sv-persist-sessions');
+        if (persistCb) settings.persistSessions = persistCb.checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
       }
 

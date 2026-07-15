@@ -728,6 +728,13 @@ function buildSessionItem(session) {
     if (session.remoteLabel) rbadge.title = 'Remote: ' + session.remoteLabel;
     summaryEl.prepend(rbadge);
   }
+  if (typeof window !== 'undefined' && window.__backgroundSessions && window.__backgroundSessions.has(session.sessionId)) {
+    const bgBadge = document.createElement('span');
+    bgBadge.className = 'bg-badge';
+    bgBadge.title = 'Running in the background (tmux) — click to reattach';
+    bgBadge.textContent = '● bg';
+    summaryEl.prepend(bgBadge);
+  }
   info.appendChild(summaryEl);
   info.appendChild(idEl);
   info.appendChild(metaEl);

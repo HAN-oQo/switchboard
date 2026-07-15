@@ -96,6 +96,10 @@ let TMUX_CONF_PATH = null;
 // Per-session socket dir (2026-07-15 amendment): each persistent session gets
 // its own tmux server on a dedicated socket under here, keyed by handle.
 let TMUX_SOCKET_DIR = null;
+// One-time renderer notice when tmux is missing but persistence is wanted —
+// shown at most once per app run (not persisted; a fresh launch re-warns if
+// tmux is still absent).
+let warnedNoTmux = false;
 function settingsPersistOn() {
   const g = getSetting('global') || {};
   return g.persistSessions !== false; // default on
@@ -1674,6 +1678,17 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     }
   } catch (err) {
     return { ok: false, error: `Error spawning PTY: ${err.message}` };
+  }
+
+  // One-time notice: tmux is missing but the user wants background persistence.
+  // Local sessions only — remote persistence is a later phase, so there's
+  // nothing to warn about on the remote path.
+  if (!isRemote && !tmuxAvailable && settingsPersistOn() && !warnedNoTmux) {
+    warnedNoTmux = true;
+    try {
+      mainWindow.webContents.send('terminal-notification', sessionId,
+        'tmux not found — background session persistence is off. Install tmux (brew install tmux) to enable it.');
+    } catch {}
   }
 
   const session = {
