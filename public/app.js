@@ -464,9 +464,11 @@ function applyRcBadge(sessionId) {
       badge = document.createElement('span');
       badge.className = 'rc-badge';
       badge.title = 'Remote Control';
-      badge.textContent = '📱';
+      badge.textContent = 'RC';
+      // Prepend so the indicator sits at the very front of the summary
+      // (before the SSH badge), making a remote-controlled session obvious.
       const target = el.querySelector('.session-summary') || el.querySelector('.grid-card-header') || el;
-      target.appendChild(badge);
+      target.prepend(badge);
     }
     badge.classList.toggle('rc-badge-confirmed', confirmed);
     badge.classList.toggle('rc-badge-pending', !confirmed);
