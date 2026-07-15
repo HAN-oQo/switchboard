@@ -1191,6 +1191,15 @@ ipcMain.handle('get-active-terminals', () => {
 ipcMain.handle('stop-session', (_event, sessionId) => {
   const session = activeSessions.get(sessionId);
   if (!session || session.exited) return { ok: false, error: 'not running' };
+  if (session.socketPath) {
+    // tmux-backed: kill the per-session server (ends the session for good),
+    // then drop its entry from the persistence store.
+    try {
+      const { spawnSync } = require('child_process');
+      spawnSync('tmux', tmuxSession.killServerArgs(session.socketPath));
+    } catch {}
+    if (session.handle) writePersistStore(sessionStore.removeEntry(readPersistStore(), session.handle));
+  }
   session.pty.kill();
   return { ok: true };
 });
@@ -1873,6 +1882,11 @@ ipcMain.on('close-terminal', (_event, sessionId) => {
   const session = activeSessions.get(sessionId);
   if (session) {
     session.rendererAttached = false;
+    if (session.handle) {
+      writePersistStore(sessionStore.upsertEntry(readPersistStore(), session.handle, {
+        wasOpen: false, lastActiveAt: Date.now(),
+      }));
+    }
     if (session.exited) {
       activeSessions.delete(sessionId);
     }
@@ -2058,12 +2072,22 @@ app.on('before-quit', () => {
     projectsWatcher = null;
   }
 
-  // Kill all PTY processes on quit
+  // Persistent (tmux-backed) sessions: detach only, so the per-session tmux
+  // server (a detached daemon) keeps the session + its process alive in the
+  // background. Non-persistent sessions: kill as before.
+  let store = readPersistStore();
   for (const [, session] of activeSessions) {
-    if (!session.exited) {
-      try { session.pty.kill(); } catch {}
+    if (session.exited) continue;
+    if (session.tmuxName) {
+      if (session.handle) store = sessionStore.upsertEntry(store, session.handle, {
+        wasOpen: true, lastActiveAt: Date.now(),
+      });
+      try { session.pty.kill(); } catch {} // kills the tmux *client*, not the session
+    } else {
+      try { session.pty.kill(); } catch {} // non-persistent: end it
     }
   }
+  writePersistStore(store);
 });
 
 // Close SQLite after all windows are closed to avoid "connection is not open" errors
