@@ -1230,9 +1230,12 @@ function liveTmuxNames() {
 // (wasOpen) and background (live but not open) entries for the renderer's
 // startup reattach + sidebar badge.
 ipcMain.handle('list-persistent-sessions', () => {
-  // Can't probe tmux right now — don't prune/lose entries on a transient
-  // PATH/availability hiccup; the store may still hold live sessions on disk.
-  if (!tmuxAvailable) return { open: [], background: [] };
+  // Gate on persistEnabled(), not just tmuxAvailable: if tmux is present but
+  // the persistSessions setting is toggled OFF, reattach must not run
+  // (spawnLocalSession would take the non-persistent branch and spawn a
+  // fresh session, orphaning the old tmux server). Also covers the transient
+  // PATH/availability hiccup case — don't prune/lose entries on disk then.
+  if (!persistEnabled()) return { open: [], background: [] };
   const live = liveTmuxNames();
   const store = sessionStore.pruneDead(readPersistStore(), live, tmuxSession.sessionName);
   writePersistStore(store);
@@ -1639,7 +1642,17 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
       // Start MCP server for this session so Claude CLI sends diffs/file opens to Switchboard
       // (skip if user disabled IDE emulation in global settings)
-      if (sessionOptions?.mcpEmulation !== false) {
+      //
+      // Also skip on reattach: `tmux new-session -A` attaches to the already-running
+      // claude process and ignores the freshly-built command and the new
+      // CLAUDE_CODE_SSE_PORT, so starting a server here would be wasted (the attached
+      // process keeps its old, now-dead port) — IDE integration is not (re)established
+      // for reattached sessions in Phase 1 (documented limitation). The --ide flag below
+      // is skipped too for the same reason (moot anyway, since -A ignores the command).
+      // Edge case: if the persisted session actually died while the app was closed,
+      // `new-session -A` creates a fresh session WITHOUT MCP/--ide — acceptable
+      // Phase-1 tradeoff.
+      if (sessionOptions?.mcpEmulation !== false && !(sessionOptions?.reattachHandle && persistEnabled())) {
         try {
           mcpServer = await startMcpServer(sessionId, [projectPath], mainWindow, log);
           claudeCmd += ' --ide';
@@ -1717,6 +1730,11 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   if (handle) {
     writePersistStore(sessionStore.upsertEntry(readPersistStore(), handle, {
       projectPath, mode: isPlainTerminal ? 'shell' : 'claude',
+      // For new and resumed Claude sessions, sessionId already is the real claude
+      // id, so the startup reattach loop's `entry.claudeSessionId || entry.handle`
+      // resolves to it (binding the reattached tab to the real transcript/sidebar
+      // row). onRealSessionId overwrites this with the post-fork id later.
+      claudeSessionId: isPlainTerminal ? undefined : sessionId,
       wasOpen: true, lastActiveAt: session._openedAt,
     }));
   }
@@ -2136,18 +2154,26 @@ app.on('before-quit', () => {
   // server (a detached daemon) keeps the session + its process alive in the
   // background. Non-persistent sessions: kill as before.
   let store = readPersistStore();
+  let touched = false;
   for (const [, session] of activeSessions) {
     if (session.exited) continue;
     if (session.tmuxName) {
-      if (session.handle) store = sessionStore.upsertEntry(store, session.handle, {
-        wasOpen: true, lastActiveAt: Date.now(),
-      });
+      if (session.handle) {
+        // wasOpen mirrors whether the tab was actually open (renderer-attached)
+        // vs. closed-but-backgrounded (close-terminal set rendererAttached=false):
+        // open tabs auto-reattach next launch, tab-closed sessions show as a
+        // background badge instead.
+        store = sessionStore.upsertEntry(store, session.handle, {
+          wasOpen: session.rendererAttached, lastActiveAt: Date.now(),
+        });
+        touched = true;
+      }
       try { session.pty.kill(); } catch {} // kills the tmux *client*, not the session
     } else {
       try { session.pty.kill(); } catch {} // non-persistent: end it
     }
   }
-  writePersistStore(store);
+  if (touched) writePersistStore(store);
 });
 
 // Close SQLite after all windows are closed to avoid "connection is not open" errors
