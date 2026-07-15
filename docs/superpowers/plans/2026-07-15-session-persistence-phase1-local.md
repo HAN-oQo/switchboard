@@ -692,3 +692,65 @@ git commit -m "feat(tmux): background badge, persistSessions setting, no-tmux no
 ## Out of Scope (later plans)
 - **Phase 2:** remote (SSH) persistence via remote-host tmux; remote liveness probe; extends `buildRemoteCommand`.
 - **Phase 3:** full scrollback capture on reattach (`tmux capture-pane`), background-session management UI (list/kill), auto-reattach cap.
+
+---
+
+## AMENDMENT (2026-07-15): per-session tmux socket model
+
+Supersedes the shared-server / `-e` env approach in Tasks 1, 4, 5, 6. Reason:
+passing the full env via `-e KEY=VAL` puts secrets into the tmux process argv
+(visible via `ps`). A **dedicated tmux socket per session** avoids this: env is
+inherited naturally through the tmux client's environ (like a plain
+`pty.spawn(shell,args,{env})`), so no `-e`, no secrets in argv, and no
+cross-session env contamination (each session has its own server).
+
+**Revised global constraint:** each persistent session runs on its own tmux
+socket `-S <socketPath>` (one server per session). Env is passed via the tmux
+client's environ (the `env` in `pty.spawn` opts) — never via `-e`. The socket
+path is derived deterministically from the handle, so it need not be stored.
+
+**Revised `tmux-session.js` API (Task 1):**
+- `socketPath(baseDir, handle) -> string` — deterministic file path, e.g.
+  `<baseDir>/sb-sock-<sanitizedHandle>` (pure string join; no fs).
+- `newSessionArgs({ name, cols, rows, confPath, socketPath, command }) -> string[]`
+  → `['-S', socketPath, '-f', confPath, 'new-session', '-A', '-s', name, '-x',
+  String(cols), '-y', String(rows), ...command]`. **No `env`/`-e` handling.**
+- `hasSessionArgs(name, socketPath) -> string[]` → `['-S', socketPath,
+  'has-session', '-t', name]`.
+- `killServerArgs(socketPath) -> string[]` → `['-S', socketPath, 'kill-server']`
+  (a per-session server hosts exactly one session, so killing the server ends it).
+- **Remove** `listArgs` and `parseSessionList` (and their tests) — replaced by
+  per-handle `has-session` probing.
+- Keep `sessionName`, `confContent`, `isVersionOutput` unchanged.
+- Update Task-1 tests: drop the `-e`/list tests; add tests for `socketPath`,
+  the socket-prefixed `newSessionArgs`, `hasSessionArgs`, `killServerArgs`.
+
+**Revised Task 4 (`spawnLocalSession`):**
+- Signature `{ shell, args, opts, handle: handleIn }` (no `envForTmux`).
+- When enabled: `const sock = tmuxSession.socketPath(TMUX_SOCKET_DIR, handle);`
+  then `pty.spawn('tmux', tmuxSession.newSessionArgs({ name, cols:opts.cols,
+  rows:opts.rows, confPath:TMUX_CONF_PATH, socketPath:sock, command:[shell,...args] }),
+  { ...opts })`. The full env rides in `opts.env` → tmux client environ → the
+  fresh per-session server → the shell. Return `{ ptyProcess, tmuxName, handle, socketPath: sock }`.
+- Add `TMUX_SOCKET_DIR = path.join(app.getPath('userData'), 'sb-sockets')` near
+  `TMUX_CONF_PATH`, `fs.mkdirSync(TMUX_SOCKET_DIR, { recursive: true })` once at init.
+- `session` object gains `socketPath`.
+
+**Revised Task 5 (lifecycle):**
+- before-quit: detach only (kill the client pty); the per-session tmux server
+  (detached daemon) keeps running. Persist `wasOpen`.
+- stop-session ("End session"): `spawnSync('tmux', tmuxSession.killServerArgs(session.socketPath))`
+  then `session.pty.kill()`; remove the store entry.
+- close-terminal: mark `wasOpen:false` (unchanged from original plan).
+
+**Revised Task 6 (startup):**
+- Liveness is per-handle: for each stored handle, `spawnSync('tmux',
+  tmuxSession.hasSessionArgs(tmuxSession.sessionName(handle),
+  tmuxSession.socketPath(TMUX_SOCKET_DIR, handle)))` and treat `status===0` as live.
+  Build the set of live session names, then `sessionStore.pruneDead(store, liveNames, sessionName)`.
+- `list-persistent-sessions` returns `{ open, background }` as before (open =
+  wasOpen entries; background = live-but-not-open). Each entry includes its
+  `sessionName`.
+- Reattach threads the existing `handle` through `openSession` → `open-terminal`
+  → `spawnLocalSession({ handle })` so `new-session -A -s sb_<handle>` on that
+  handle's socket reattaches the SAME live session.
