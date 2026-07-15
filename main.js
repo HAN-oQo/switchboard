@@ -102,19 +102,26 @@ function readPersistStore() { return getSetting('persistentSessions') || {}; }
 function writePersistStore(store) { setSetting('persistentSessions', store); }
 
 // Spawn a local session, wrapped in tmux when persistence is enabled.
-// shell/args/opts are the existing pty.spawn inputs; envForTmux carries the
-// (small) subset of env vars that must cross the tmux server boundary via -e.
+// shell/args/opts are the existing pty.spawn inputs (opts.env is the FULL
+// intended per-session env — identical to what a direct pty.spawn would get).
 // Returns { ptyProcess, tmuxName, handle }; tmuxName/handle are null when
 // persistence is disabled (identical behavior to the pre-tmux fallback).
-function spawnLocalSession({ shell, args, opts, envForTmux, handle: handleIn }) {
+// handle: caller may pass a pre-existing handle to reattach a known tmux
+// session; left in place for a later reattach feature — do not remove.
+function spawnLocalSession({ shell, args, opts, handle: handleIn }) {
   if (!persistEnabled()) {
     return { ptyProcess: pty.spawn(shell, args, opts), tmuxName: null, handle: null };
   }
   const handle = handleIn || crypto.randomUUID();
   const tmuxName = tmuxSession.sessionName(handle);
+  // Pass the FULL per-session env via -e (not just a curated subset): the
+  // shared, long-lived tmux server freezes its environment at server-start,
+  // so anything not passed via -e falls back to whichever stale/foreign env
+  // started the server, silently leaking vars across sessions (e.g. the
+  // plain-terminal shim env leaking into a later `claude` process).
   const tmuxArgs = tmuxSession.newSessionArgs({
     name: tmuxName, cols: opts.cols, rows: opts.rows,
-    confPath: TMUX_CONF_PATH, env: envForTmux || {},
+    confPath: TMUX_CONF_PATH, env: opts.env || {},
     command: [shell, ...args],
   });
   // env passed to the tmux CLIENT; the -e flags carry per-session env into the server.
@@ -1510,7 +1517,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
           },
         };
         const r = spawnLocalSession({
-          shell, args: shellArgs(shell, undefined, shellExtraArgs), opts: spawnOpts, envForTmux: {},
+          shell, args: shellArgs(shell, undefined, shellExtraArgs), opts: spawnOpts,
         });
         ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle;
       }
@@ -1601,11 +1608,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
           // app's minimal Electron environment won't trigger those sequences.
           env: ptyEnv,
         };
-        // Only CLAUDE_CODE_SSE_PORT must cross the tmux server boundary (-e).
-        const envForTmux = ptyEnv.CLAUDE_CODE_SSE_PORT
-          ? { CLAUDE_CODE_SSE_PORT: ptyEnv.CLAUDE_CODE_SSE_PORT } : {};
         const r = spawnLocalSession({
-          shell, args: shellArgs(shell, claudeCmd, shellExtraArgs), opts: spawnOpts, envForTmux,
+          shell, args: shellArgs(shell, claudeCmd, shellExtraArgs), opts: spawnOpts,
         });
         ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle;
       }
