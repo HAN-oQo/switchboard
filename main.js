@@ -1226,6 +1226,9 @@ function liveTmuxNames() {
 // (wasOpen) and background (live but not open) entries for the renderer's
 // startup reattach + sidebar badge.
 ipcMain.handle('list-persistent-sessions', () => {
+  // Can't probe tmux right now — don't prune/lose entries on a transient
+  // PATH/availability hiccup; the store may still hold live sessions on disk.
+  if (!tmuxAvailable) return { open: [], background: [] };
   const live = liveTmuxNames();
   const store = sessionStore.pruneDead(readPersistStore(), live, tmuxSession.sessionName);
   writePersistStore(store);
@@ -1930,7 +1933,14 @@ ipcMain.on('close-terminal', (_event, sessionId) => {
 
 // Session transitions → session-transitions.js
 const sessionTransitions = require('./session-transitions');
-sessionTransitions.init({ PROJECTS_DIR, activeSessions, getMainWindow: () => mainWindow, log, rekeyMcpServer });
+sessionTransitions.init({
+  PROJECTS_DIR, activeSessions, getMainWindow: () => mainWindow, log, rekeyMcpServer,
+  onRealSessionId: (session, newId) => {
+    if (session && session.handle) {
+      try { writePersistStore(sessionStore.upsertEntry(readPersistStore(), session.handle, { claudeSessionId: newId })); } catch {}
+    }
+  },
+});
 const { detectSessionTransitions } = sessionTransitions;
 
 // --- fs.watch on projects directory ---

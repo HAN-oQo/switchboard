@@ -5,7 +5,7 @@ const fs = require('fs');
  * Fork / plan-accept detection for active PTY sessions.
  * Call init(ctx) once with shared context.
  */
-let PROJECTS_DIR, activeSessions, getMainWindow, log, rekeyMcpServer;
+let PROJECTS_DIR, activeSessions, getMainWindow, log, rekeyMcpServer, onRealSessionId;
 
 function init(ctx) {
   PROJECTS_DIR = ctx.PROJECTS_DIR;
@@ -13,6 +13,7 @@ function init(ctx) {
   getMainWindow = ctx.getMainWindow;
   log = ctx.log;
   rekeyMcpServer = ctx.rekeyMcpServer;
+  onRealSessionId = ctx.onRealSessionId;
 }
 
 // --- Fork / plan-accept detection ---
@@ -173,6 +174,7 @@ function detectSessionTransitions(folder) {
         log.info(`[session-transition] ${sessionId} → ${newId} (${signals.forkedFrom || session.forkFrom ? 'fork' : 'plan-accept'})`);
         session.knownJsonlFiles = new Set(currentFiles);
         session.realSessionId = newId;
+        if (onRealSessionId) onRealSessionId(session, newId);
         // Update slug from new session
         if (signals.slug) session.sessionSlug = signals.slug;
         activeSessions.delete(sessionId);
