@@ -3669,6 +3669,26 @@ body { display: flex; flex-direction: column; }
   -webkit-text-fill-color: currentColor;
 }
 
+.bg-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  line-height: 1;
+  padding: 2px 4px;
+  margin-right: 5px;
+  border-radius: 3px;
+  color: #6fcf8f;
+  background: rgba(111, 207, 143, 0.14);
+  border: 1px solid rgba(111, 207, 143, 0.35);
+  vertical-align: middle;
+  position: relative;
+  top: -1px;
+  /* Immune to the .session-summary cli-busy text-clip shimmer (see .remote-badge). */
+  -webkit-text-fill-color: currentColor;
+}
+
 /* Terminal sessions: green status dot */
 .session-item.is-terminal .session-status-dot.running {
   background: #3ecf5a;

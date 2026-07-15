@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const pty = require('node-pty');
+const crypto = require('crypto');
 const log = require('electron-log');
 // getFolderIndexMtimeMs moved to session-cache.js
 const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
@@ -27,6 +28,8 @@ const cleanPtyEnv = Object.fromEntries(
 
 // Shell profiles → shell-profiles.js
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, isSshProfile } = require('./shell-profiles');
+const tmuxSession = require('./tmux-session');
+const sessionStore = require('./session-store');
 const remoteHosts = require('./remote-hosts');
 const remoteIndex = require('./remote-index');
 const remoteIde = require('./remote-ide');
@@ -83,6 +86,61 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 // Active PTY sessions
 const activeSessions = new Map();
 let mainWindow = null;
+
+// tmux availability + isolated conf (Phase 1: local session persistence).
+// tmuxAvailable/TMUX_CONF_PATH/TMUX_SOCKET_DIR are set once during
+// app.whenReady(); declared at module scope so later session-spawning code
+// (outside that closure) can read them via persistEnabled().
+let tmuxAvailable = false;
+let TMUX_CONF_PATH = null;
+// Per-session socket dir (2026-07-15 amendment): each persistent session gets
+// its own tmux server on a dedicated socket under here, keyed by handle.
+let TMUX_SOCKET_DIR = null;
+// One-time renderer notice when tmux is missing but persistence is wanted —
+// shown at most once per app run (not persisted; a fresh launch re-warns if
+// tmux is still absent).
+let warnedNoTmux = false;
+function settingsPersistOn() {
+  const g = getSetting('global') || {};
+  return g.persistSessions !== false; // default on
+}
+function persistEnabled() { return tmuxAvailable && settingsPersistOn(); }
+function readPersistStore() { return getSetting('persistentSessions') || {}; }
+function writePersistStore(store) { setSetting('persistentSessions', store); }
+
+// Spawn a local session, wrapped in tmux when persistence is enabled.
+// shell/args/opts are the existing pty.spawn inputs (opts.env is the FULL
+// intended per-session env — identical to what a direct pty.spawn would get).
+// Returns { ptyProcess, tmuxName, handle, socketPath }; all null (besides
+// ptyProcess) when persistence is disabled (identical behavior to the
+// pre-tmux fallback).
+// handle: caller may pass a pre-existing handle to reattach a known tmux
+// session; left in place for a later reattach feature — do not remove.
+//
+// Per-session socket model (2026-07-15 amendment): each session runs on its
+// OWN tmux server (`-S <socketPath>`), not a shared one. Env rides the tmux
+// CLIENT's environ via opts.env — passed to pty.spawn exactly as a direct
+// pty.spawn(shell,args,{env}) would be — never via `-e`, which would put
+// secrets into the tmux process argv (visible via `ps`). A fresh per-session
+// server also means no stale/foreign env leaking across sessions.
+function spawnLocalSession({ shell, args, opts, handle: handleIn }) {
+  if (!persistEnabled()) {
+    return { ptyProcess: pty.spawn(shell, args, opts), tmuxName: null, handle: null, socketPath: null };
+  }
+  const handle = handleIn || crypto.randomUUID();
+  const tmuxName = tmuxSession.sessionName(handle);
+  const sock = tmuxSession.socketPath(TMUX_SOCKET_DIR, handle);
+  const tmuxArgs = tmuxSession.newSessionArgs({
+    name: tmuxName, cols: opts.cols, rows: opts.rows,
+    confPath: TMUX_CONF_PATH, socketPath: sock,
+    command: [shell, ...args],
+  });
+  // opts (incl. opts.env, the full per-session env) passed straight through
+  // to the tmux CLIENT process; the client forwards its environ to the
+  // fresh per-session server it spawns, which forwards it to the shell.
+  const ptyProcess = pty.spawn('tmux', tmuxArgs, { ...opts });
+  return { ptyProcess, tmuxName, handle, socketPath: sock };
+}
 
 function createWindow() {
   // Restore saved window bounds
@@ -1137,8 +1195,56 @@ ipcMain.handle('get-active-terminals', () => {
 ipcMain.handle('stop-session', (_event, sessionId) => {
   const session = activeSessions.get(sessionId);
   if (!session || session.exited) return { ok: false, error: 'not running' };
+  if (session.socketPath) {
+    // tmux-backed: kill the per-session server (ends the session for good),
+    // then drop its entry from the persistence store.
+    try {
+      const { spawnSync } = require('child_process');
+      spawnSync('tmux', tmuxSession.killServerArgs(session.socketPath));
+    } catch {}
+    if (session.handle) writePersistStore(sessionStore.removeEntry(readPersistStore(), session.handle));
+  }
   session.pty.kill();
   return { ok: true };
+});
+
+// Per-handle liveness probe (2026-07-15 amendment: no shared-server `tmux ls`
+// — each session has its own socket, so we probe each stored handle's
+// dedicated server with `has-session` instead of listing one shared server).
+function liveTmuxNames() {
+  if (!tmuxAvailable) return [];
+  const { spawnSync } = require('child_process');
+  const names = [];
+  for (const handle of Object.keys(readPersistStore())) {
+    const name = tmuxSession.sessionName(handle);
+    try {
+      const r = spawnSync('tmux', tmuxSession.hasSessionArgs(name, tmuxSession.socketPath(TMUX_SOCKET_DIR, handle)));
+      if (r.status === 0) names.push(name);
+    } catch {}
+  }
+  return names;
+}
+
+// --- IPC: list-persistent-sessions ---
+// Prunes dead entries against live per-handle probes, then returns the open
+// (wasOpen) and background (live but not open) entries for the renderer's
+// startup reattach + sidebar badge.
+ipcMain.handle('list-persistent-sessions', () => {
+  // Gate on persistEnabled(), not just tmuxAvailable: if tmux is present but
+  // the persistSessions setting is toggled OFF, reattach must not run
+  // (spawnLocalSession would take the non-persistent branch and spawn a
+  // fresh session, orphaning the old tmux server). Also covers the transient
+  // PATH/availability hiccup case — don't prune/lose entries on disk then.
+  if (!persistEnabled()) return { open: [], background: [] };
+  const live = liveTmuxNames();
+  const store = sessionStore.pruneDead(readPersistStore(), live, tmuxSession.sessionName);
+  writePersistStore(store);
+  const openHandles = new Set(sessionStore.openEntries(store).map(e => e.handle));
+  const withName = (e) => ({ ...e, sessionName: tmuxSession.sessionName(e.handle) });
+  return {
+    open: sessionStore.openEntries(store).map(withName),
+    background: sessionStore.backgroundEntries(store, openHandles).map(withName),
+  };
 });
 
 // --- IPC: toggle-star ---
@@ -1382,6 +1488,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   let ptyProcess;
   let mcpServer = null;
   let ideInfo = null; // Phase 3 remote-IDE tunnel info (outer scope for teardown)
+  let tmuxName = null;
+  let handle = null;
+  let socketPath = null;
   try {
     if (isRemote) {
       // Remote (SSH) session: run Claude (or a login shell) on the remote host.
@@ -1454,20 +1563,27 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       // Plain terminal: interactive login shell, no claude command
       // Inject a shell function to override `claude` with a helpful message
       const claudeShim = 'claude() { echo "\\033[33mTo start a Claude session, use the + button in the sidebar.\\033[0m"; return 1; }; export -f claude 2>/dev/null;';
-      ptyProcess = pty.spawn(shell, shellArgs(shell, undefined, shellExtraArgs), {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
-        cwd: isWsl ? os.homedir() : projectPath,
-        env: {
-          ...cleanPtyEnv,
-          TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
-          CLAUDECODE: '1',
-          // ZDOTDIR trick won't work reliably; instead inject via ENV (sh/bash) or precmd
-          ENV: claudeShim,
-          BASH_ENV: claudeShim,
-        },
-      });
+      {
+        const spawnOpts = {
+          name: 'xterm-256color',
+          cols: 120,
+          rows: 30,
+          cwd: isWsl ? os.homedir() : projectPath,
+          env: {
+            ...cleanPtyEnv,
+            TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+            CLAUDECODE: '1',
+            // ZDOTDIR trick won't work reliably; instead inject via ENV (sh/bash) or precmd
+            ENV: claudeShim,
+            BASH_ENV: claudeShim,
+          },
+        };
+        const r = spawnLocalSession({
+          shell, args: shellArgs(shell, undefined, shellExtraArgs), opts: spawnOpts,
+          handle: sessionOptions?.reattachHandle,
+        });
+        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle; socketPath = r.socketPath;
+      }
       // For zsh, ENV/BASH_ENV don't apply — write the function after shell starts
       setTimeout(() => {
         if (!ptyProcess._isDisposed) {
@@ -1526,7 +1642,17 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
       // Start MCP server for this session so Claude CLI sends diffs/file opens to Switchboard
       // (skip if user disabled IDE emulation in global settings)
-      if (sessionOptions?.mcpEmulation !== false) {
+      //
+      // Also skip on reattach: `tmux new-session -A` attaches to the already-running
+      // claude process and ignores the freshly-built command and the new
+      // CLAUDE_CODE_SSE_PORT, so starting a server here would be wasted (the attached
+      // process keeps its old, now-dead port) — IDE integration is not (re)established
+      // for reattached sessions in Phase 1 (documented limitation). The --ide flag below
+      // is skipped too for the same reason (moot anyway, since -A ignores the command).
+      // Edge case: if the persisted session actually died while the app was closed,
+      // `new-session -A` creates a fresh session WITHOUT MCP/--ide — acceptable
+      // Phase-1 tradeoff.
+      if (sessionOptions?.mcpEmulation !== false && !(sessionOptions?.reattachHandle && persistEnabled())) {
         try {
           mcpServer = await startMcpServer(sessionId, [projectPath], mainWindow, log);
           claudeCmd += ' --ide';
@@ -1544,20 +1670,38 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
       }
 
-      ptyProcess = pty.spawn(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
-        cwd: isWsl ? os.homedir() : projectPath,
-        // TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
-        // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
-        // app's minimal Electron environment won't trigger those sequences.
-        env: ptyEnv,
-      });
+      {
+        const spawnOpts = {
+          name: 'xterm-256color',
+          cols: 120,
+          rows: 30,
+          cwd: isWsl ? os.homedir() : projectPath,
+          // TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
+          // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
+          // app's minimal Electron environment won't trigger those sequences.
+          env: ptyEnv,
+        };
+        const r = spawnLocalSession({
+          shell, args: shellArgs(shell, claudeCmd, shellExtraArgs), opts: spawnOpts,
+          handle: sessionOptions?.reattachHandle,
+        });
+        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle; socketPath = r.socketPath;
+      }
 
     }
   } catch (err) {
     return { ok: false, error: `Error spawning PTY: ${err.message}` };
+  }
+
+  // One-time notice: tmux is missing but the user wants background persistence.
+  // Local sessions only — remote persistence is a later phase, so there's
+  // nothing to warn about on the remote path.
+  if (!isRemote && !tmuxAvailable && settingsPersistOn() && !warnedNoTmux) {
+    warnedNoTmux = true;
+    try {
+      mainWindow.webContents.send('terminal-notification', sessionId,
+        'tmux not found — background session persistence is off. Install tmux (brew install tmux) to enable it.');
+    } catch {}
   }
 
   const session = {
@@ -1576,8 +1720,24 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     remoteIde: (isRemote && ideInfo)
       ? { remotePort: ideInfo.remotePort, localPort: ideInfo.mcpServer.port, sock: ideInfo.sock }
       : null,
+    // Phase 1: tmux-backed local session persistence (null when disabled or remote).
+    // socketPath is derivable from handle (tmuxSession.socketPath), but kept
+    // here too so Task 5's kill-server lifecycle doesn't need to recompute it.
+    tmuxName, handle, socketPath,
   };
   activeSessions.set(sessionId, session);
+
+  if (handle) {
+    writePersistStore(sessionStore.upsertEntry(readPersistStore(), handle, {
+      projectPath, mode: isPlainTerminal ? 'shell' : 'claude',
+      // For new and resumed Claude sessions, sessionId already is the real claude
+      // id, so the startup reattach loop's `entry.claudeSessionId || entry.handle`
+      // resolves to it (binding the reattached tab to the real transcript/sidebar
+      // row). onRealSessionId overwrites this with the post-fork id later.
+      claudeSessionId: isPlainTerminal ? undefined : sessionId,
+      wasOpen: true, lastActiveAt: session._openedAt,
+    }));
+  }
 
   if (sessionOptions?.remoteControl) {
     setRemoteControlState(session, sessionId, {
@@ -1793,6 +1953,11 @@ ipcMain.on('close-terminal', (_event, sessionId) => {
   const session = activeSessions.get(sessionId);
   if (session) {
     session.rendererAttached = false;
+    if (session.handle) {
+      writePersistStore(sessionStore.upsertEntry(readPersistStore(), session.handle, {
+        wasOpen: false, lastActiveAt: Date.now(),
+      }));
+    }
     if (session.exited) {
       activeSessions.delete(sessionId);
     }
@@ -1801,7 +1966,14 @@ ipcMain.on('close-terminal', (_event, sessionId) => {
 
 // Session transitions → session-transitions.js
 const sessionTransitions = require('./session-transitions');
-sessionTransitions.init({ PROJECTS_DIR, activeSessions, getMainWindow: () => mainWindow, log, rekeyMcpServer });
+sessionTransitions.init({
+  PROJECTS_DIR, activeSessions, getMainWindow: () => mainWindow, log, rekeyMcpServer,
+  onRealSessionId: (session, newId) => {
+    if (session && session.handle) {
+      try { writePersistStore(sessionStore.upsertEntry(readPersistStore(), session.handle, { claudeSessionId: newId })); } catch {}
+    }
+  },
+});
 const { detectSessionTransitions } = sessionTransitions;
 
 // --- fs.watch on projects directory ---
@@ -1885,6 +2057,26 @@ ipcMain.handle('updater-install', () => {
 
 // --- App lifecycle ---
 app.whenReady().then(() => {
+  // Detect tmux availability and materialize an isolated tmux conf
+  // (Phase 1: local session persistence). Isolated conf avoids inheriting
+  // the user's ~/.tmux.conf (status bars, prefix keys, mouse mode) which
+  // would fight xterm and the Claude TUI.
+  try {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync('tmux', ['-V'], { encoding: 'utf8' });
+    tmuxAvailable = r.status === 0 && tmuxSession.isVersionOutput(r.stdout);
+  } catch { tmuxAvailable = false; }
+
+  TMUX_CONF_PATH = path.join(app.getPath('userData'), 'sb.tmux.conf');
+  try { fs.writeFileSync(TMUX_CONF_PATH, tmuxSession.confContent()); } catch (e) { log.warn(`[tmux] conf write failed: ${e.message}`); }
+
+  // Per-session socket dir (2026-07-15 amendment): one tmux server per
+  // session lives on its own socket under here.
+  TMUX_SOCKET_DIR = path.join(app.getPath('userData'), 'sb-sockets');
+  try { fs.mkdirSync(TMUX_SOCKET_DIR, { recursive: true }); } catch (e) { log.warn(`[tmux] socket dir mkdir failed: ${e.message}`); }
+
+  log.info(`[tmux] available=${tmuxAvailable} persistDefault=${settingsPersistOn()}`);
+
   buildMenu();
   createWindow();
   startProjectsWatcher();
@@ -1958,12 +2150,30 @@ app.on('before-quit', () => {
     projectsWatcher = null;
   }
 
-  // Kill all PTY processes on quit
+  // Persistent (tmux-backed) sessions: detach only, so the per-session tmux
+  // server (a detached daemon) keeps the session + its process alive in the
+  // background. Non-persistent sessions: kill as before.
+  let store = readPersistStore();
+  let touched = false;
   for (const [, session] of activeSessions) {
-    if (!session.exited) {
-      try { session.pty.kill(); } catch {}
+    if (session.exited) continue;
+    if (session.tmuxName) {
+      if (session.handle) {
+        // wasOpen mirrors whether the tab was actually open (renderer-attached)
+        // vs. closed-but-backgrounded (close-terminal set rendererAttached=false):
+        // open tabs auto-reattach next launch, tab-closed sessions show as a
+        // background badge instead.
+        store = sessionStore.upsertEntry(store, session.handle, {
+          wasOpen: session.rendererAttached, lastActiveAt: Date.now(),
+        });
+        touched = true;
+      }
+      try { session.pty.kill(); } catch {} // kills the tmux *client*, not the session
+    } else {
+      try { session.pty.kill(); } catch {} // non-persistent: end it
     }
   }
+  if (touched) writePersistStore(store);
 });
 
 // Close SQLite after all windows are closed to avoid "connection is not open" errors
