@@ -28,6 +28,7 @@ const cleanPtyEnv = Object.fromEntries(
 // Shell profiles → shell-profiles.js
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, isSshProfile } = require('./shell-profiles');
 const tmuxSession = require('./tmux-session');
+const sessionStore = require('./session-store');
 const remoteHosts = require('./remote-hosts');
 const remoteIndex = require('./remote-index');
 const remoteIde = require('./remote-ide');
@@ -96,6 +97,8 @@ function settingsPersistOn() {
   return g.persistSessions !== false; // default on
 }
 function persistEnabled() { return tmuxAvailable && settingsPersistOn(); }
+function readPersistStore() { return getSetting('persistentSessions') || {}; }
+function writePersistStore(store) { setSetting('persistentSessions', store); }
 
 function createWindow() {
   // Restore saved window bounds
