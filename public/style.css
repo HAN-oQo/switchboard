@@ -969,16 +969,37 @@ body { display: flex; flex-direction: column; }
   color: rgba(79,195,247,0.6);
 }
 
-/* ---- Remote Control badge (sidebar item + grid card) ---- */
+/* ---- Remote Control badge (sidebar item + grid card) ----
+   Text pill placed at the FRONT of the summary (before the SSH badge) so a
+   remote-controlled session is obvious at a glance. Green = live/confirmed,
+   amber (pulsing) = awaiting phone confirmation. */
 .rc-badge {
-  margin-left: 6px;
-  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
   line-height: 1;
-  filter: grayscale(1) opacity(0.6);
+  padding: 2px 4px;
+  margin-right: 5px;
+  border-radius: 3px;
+  color: #7ee787;
+  background: rgba(126, 231, 135, 0.16);
+  border: 1px solid rgba(126, 231, 135, 0.45);
+  vertical-align: middle;
+  position: relative;
+  top: -1px;
+  /* Immune to the .session-summary cli-busy text-clip shimmer (see .remote-badge). */
+  -webkit-text-fill-color: currentColor;
 }
-.rc-badge-confirmed { filter: none; }
-.rc-badge-pending { animation: rc-pulse 1.2s ease-in-out infinite; }
-@keyframes rc-pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+.rc-badge-confirmed { color: #7ee787; }
+.rc-badge-pending {
+  color: #f0b429;
+  background: rgba(240, 180, 41, 0.16);
+  border-color: rgba(240, 180, 41, 0.45);
+  animation: rc-pulse 1.2s ease-in-out infinite;
+}
+@keyframes rc-pulse { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
 .session-item.has-remote-control { position: relative; }
 
 /* ---- Needs attention indicator (ripple) ---- */
@@ -3642,6 +3663,10 @@ body { display: flex; flex-direction: column; }
   vertical-align: middle;
   position: relative;
   top: -1px;
+  /* Immune to the .session-summary cli-busy text-clip shimmer, which sets an
+     inherited -webkit-text-fill-color: transparent that would otherwise hide
+     the "SSH" label while the session is running. */
+  -webkit-text-fill-color: currentColor;
 }
 
 /* Terminal sessions: green status dot */
