@@ -27,6 +27,7 @@ const cleanPtyEnv = Object.fromEntries(
 
 // Shell profiles → shell-profiles.js
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, isSshProfile } = require('./shell-profiles');
+const tmuxSession = require('./tmux-session');
 const remoteHosts = require('./remote-hosts');
 const remoteIndex = require('./remote-index');
 const remoteIde = require('./remote-ide');
@@ -83,6 +84,18 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 // Active PTY sessions
 const activeSessions = new Map();
 let mainWindow = null;
+
+// tmux availability + isolated conf (Phase 1: local session persistence).
+// tmuxAvailable/TMUX_CONF_PATH are set once during app.whenReady(); declared
+// at module scope so later session-spawning code (outside that closure) can
+// read them via persistEnabled().
+let tmuxAvailable = false;
+let TMUX_CONF_PATH = null;
+function settingsPersistOn() {
+  const g = getSetting('global') || {};
+  return g.persistSessions !== false; // default on
+}
+function persistEnabled() { return tmuxAvailable && settingsPersistOn(); }
 
 function createWindow() {
   // Restore saved window bounds
@@ -1885,6 +1898,21 @@ ipcMain.handle('updater-install', () => {
 
 // --- App lifecycle ---
 app.whenReady().then(() => {
+  // Detect tmux availability and materialize an isolated tmux conf
+  // (Phase 1: local session persistence). Isolated conf avoids inheriting
+  // the user's ~/.tmux.conf (status bars, prefix keys, mouse mode) which
+  // would fight xterm and the Claude TUI.
+  try {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync('tmux', ['-V'], { encoding: 'utf8' });
+    tmuxAvailable = r.status === 0 && tmuxSession.isVersionOutput(r.stdout);
+  } catch { tmuxAvailable = false; }
+
+  TMUX_CONF_PATH = path.join(app.getPath('userData'), 'sb.tmux.conf');
+  try { fs.writeFileSync(TMUX_CONF_PATH, tmuxSession.confContent()); } catch (e) { log.warn(`[tmux] conf write failed: ${e.message}`); }
+
+  log.info(`[tmux] available=${tmuxAvailable} persistDefault=${settingsPersistOn()}`);
+
   buildMenu();
   createWindow();
   startProjectsWatcher();
