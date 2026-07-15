@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const pty = require('node-pty');
+const crypto = require('crypto');
 const log = require('electron-log');
 // getFolderIndexMtimeMs moved to session-cache.js
 const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
@@ -99,6 +100,27 @@ function settingsPersistOn() {
 function persistEnabled() { return tmuxAvailable && settingsPersistOn(); }
 function readPersistStore() { return getSetting('persistentSessions') || {}; }
 function writePersistStore(store) { setSetting('persistentSessions', store); }
+
+// Spawn a local session, wrapped in tmux when persistence is enabled.
+// shell/args/opts are the existing pty.spawn inputs; envForTmux carries the
+// (small) subset of env vars that must cross the tmux server boundary via -e.
+// Returns { ptyProcess, tmuxName, handle }; tmuxName/handle are null when
+// persistence is disabled (identical behavior to the pre-tmux fallback).
+function spawnLocalSession({ shell, args, opts, envForTmux, handle: handleIn }) {
+  if (!persistEnabled()) {
+    return { ptyProcess: pty.spawn(shell, args, opts), tmuxName: null, handle: null };
+  }
+  const handle = handleIn || crypto.randomUUID();
+  const tmuxName = tmuxSession.sessionName(handle);
+  const tmuxArgs = tmuxSession.newSessionArgs({
+    name: tmuxName, cols: opts.cols, rows: opts.rows,
+    confPath: TMUX_CONF_PATH, env: envForTmux || {},
+    command: [shell, ...args],
+  });
+  // env passed to the tmux CLIENT; the -e flags carry per-session env into the server.
+  const ptyProcess = pty.spawn('tmux', tmuxArgs, { ...opts });
+  return { ptyProcess, tmuxName, handle };
+}
 
 function createWindow() {
   // Restore saved window bounds
@@ -1398,6 +1420,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   let ptyProcess;
   let mcpServer = null;
   let ideInfo = null; // Phase 3 remote-IDE tunnel info (outer scope for teardown)
+  let tmuxName = null;
+  let handle = null;
   try {
     if (isRemote) {
       // Remote (SSH) session: run Claude (or a login shell) on the remote host.
@@ -1470,20 +1494,26 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       // Plain terminal: interactive login shell, no claude command
       // Inject a shell function to override `claude` with a helpful message
       const claudeShim = 'claude() { echo "\\033[33mTo start a Claude session, use the + button in the sidebar.\\033[0m"; return 1; }; export -f claude 2>/dev/null;';
-      ptyProcess = pty.spawn(shell, shellArgs(shell, undefined, shellExtraArgs), {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
-        cwd: isWsl ? os.homedir() : projectPath,
-        env: {
-          ...cleanPtyEnv,
-          TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
-          CLAUDECODE: '1',
-          // ZDOTDIR trick won't work reliably; instead inject via ENV (sh/bash) or precmd
-          ENV: claudeShim,
-          BASH_ENV: claudeShim,
-        },
-      });
+      {
+        const spawnOpts = {
+          name: 'xterm-256color',
+          cols: 120,
+          rows: 30,
+          cwd: isWsl ? os.homedir() : projectPath,
+          env: {
+            ...cleanPtyEnv,
+            TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+            CLAUDECODE: '1',
+            // ZDOTDIR trick won't work reliably; instead inject via ENV (sh/bash) or precmd
+            ENV: claudeShim,
+            BASH_ENV: claudeShim,
+          },
+        };
+        const r = spawnLocalSession({
+          shell, args: shellArgs(shell, undefined, shellExtraArgs), opts: spawnOpts, envForTmux: {},
+        });
+        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle;
+      }
       // For zsh, ENV/BASH_ENV don't apply — write the function after shell starts
       setTimeout(() => {
         if (!ptyProcess._isDisposed) {
@@ -1560,16 +1590,25 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
       }
 
-      ptyProcess = pty.spawn(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
-        cwd: isWsl ? os.homedir() : projectPath,
-        // TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
-        // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
-        // app's minimal Electron environment won't trigger those sequences.
-        env: ptyEnv,
-      });
+      {
+        const spawnOpts = {
+          name: 'xterm-256color',
+          cols: 120,
+          rows: 30,
+          cwd: isWsl ? os.homedir() : projectPath,
+          // TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
+          // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
+          // app's minimal Electron environment won't trigger those sequences.
+          env: ptyEnv,
+        };
+        // Only CLAUDE_CODE_SSE_PORT must cross the tmux server boundary (-e).
+        const envForTmux = ptyEnv.CLAUDE_CODE_SSE_PORT
+          ? { CLAUDE_CODE_SSE_PORT: ptyEnv.CLAUDE_CODE_SSE_PORT } : {};
+        const r = spawnLocalSession({
+          shell, args: shellArgs(shell, claudeCmd, shellExtraArgs), opts: spawnOpts, envForTmux,
+        });
+        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle;
+      }
 
     }
   } catch (err) {
@@ -1592,8 +1631,17 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     remoteIde: (isRemote && ideInfo)
       ? { remotePort: ideInfo.remotePort, localPort: ideInfo.mcpServer.port, sock: ideInfo.sock }
       : null,
+    // Phase 1: tmux-backed local session persistence (null when disabled or remote).
+    tmuxName, handle,
   };
   activeSessions.set(sessionId, session);
+
+  if (handle) {
+    writePersistStore(sessionStore.upsertEntry(readPersistStore(), handle, {
+      projectPath, mode: isPlainTerminal ? 'shell' : 'claude',
+      wasOpen: true, lastActiveAt: session._openedAt,
+    }));
+  }
 
   if (sessionOptions?.remoteControl) {
     setRemoteControlState(session, sessionId, {
