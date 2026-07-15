@@ -88,11 +88,14 @@ const activeSessions = new Map();
 let mainWindow = null;
 
 // tmux availability + isolated conf (Phase 1: local session persistence).
-// tmuxAvailable/TMUX_CONF_PATH are set once during app.whenReady(); declared
-// at module scope so later session-spawning code (outside that closure) can
-// read them via persistEnabled().
+// tmuxAvailable/TMUX_CONF_PATH/TMUX_SOCKET_DIR are set once during
+// app.whenReady(); declared at module scope so later session-spawning code
+// (outside that closure) can read them via persistEnabled().
 let tmuxAvailable = false;
 let TMUX_CONF_PATH = null;
+// Per-session socket dir (2026-07-15 amendment): each persistent session gets
+// its own tmux server on a dedicated socket under here, keyed by handle.
+let TMUX_SOCKET_DIR = null;
 function settingsPersistOn() {
   const g = getSetting('global') || {};
   return g.persistSessions !== false; // default on
@@ -104,29 +107,35 @@ function writePersistStore(store) { setSetting('persistentSessions', store); }
 // Spawn a local session, wrapped in tmux when persistence is enabled.
 // shell/args/opts are the existing pty.spawn inputs (opts.env is the FULL
 // intended per-session env — identical to what a direct pty.spawn would get).
-// Returns { ptyProcess, tmuxName, handle }; tmuxName/handle are null when
-// persistence is disabled (identical behavior to the pre-tmux fallback).
+// Returns { ptyProcess, tmuxName, handle, socketPath }; all null (besides
+// ptyProcess) when persistence is disabled (identical behavior to the
+// pre-tmux fallback).
 // handle: caller may pass a pre-existing handle to reattach a known tmux
 // session; left in place for a later reattach feature — do not remove.
+//
+// Per-session socket model (2026-07-15 amendment): each session runs on its
+// OWN tmux server (`-S <socketPath>`), not a shared one. Env rides the tmux
+// CLIENT's environ via opts.env — passed to pty.spawn exactly as a direct
+// pty.spawn(shell,args,{env}) would be — never via `-e`, which would put
+// secrets into the tmux process argv (visible via `ps`). A fresh per-session
+// server also means no stale/foreign env leaking across sessions.
 function spawnLocalSession({ shell, args, opts, handle: handleIn }) {
   if (!persistEnabled()) {
-    return { ptyProcess: pty.spawn(shell, args, opts), tmuxName: null, handle: null };
+    return { ptyProcess: pty.spawn(shell, args, opts), tmuxName: null, handle: null, socketPath: null };
   }
   const handle = handleIn || crypto.randomUUID();
   const tmuxName = tmuxSession.sessionName(handle);
-  // Pass the FULL per-session env via -e (not just a curated subset): the
-  // shared, long-lived tmux server freezes its environment at server-start,
-  // so anything not passed via -e falls back to whichever stale/foreign env
-  // started the server, silently leaking vars across sessions (e.g. the
-  // plain-terminal shim env leaking into a later `claude` process).
+  const sock = tmuxSession.socketPath(TMUX_SOCKET_DIR, handle);
   const tmuxArgs = tmuxSession.newSessionArgs({
     name: tmuxName, cols: opts.cols, rows: opts.rows,
-    confPath: TMUX_CONF_PATH, env: opts.env || {},
+    confPath: TMUX_CONF_PATH, socketPath: sock,
     command: [shell, ...args],
   });
-  // env passed to the tmux CLIENT; the -e flags carry per-session env into the server.
+  // opts (incl. opts.env, the full per-session env) passed straight through
+  // to the tmux CLIENT process; the client forwards its environ to the
+  // fresh per-session server it spawns, which forwards it to the shell.
   const ptyProcess = pty.spawn('tmux', tmuxArgs, { ...opts });
-  return { ptyProcess, tmuxName, handle };
+  return { ptyProcess, tmuxName, handle, socketPath: sock };
 }
 
 function createWindow() {
@@ -1429,6 +1438,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   let ideInfo = null; // Phase 3 remote-IDE tunnel info (outer scope for teardown)
   let tmuxName = null;
   let handle = null;
+  let socketPath = null;
   try {
     if (isRemote) {
       // Remote (SSH) session: run Claude (or a login shell) on the remote host.
@@ -1519,7 +1529,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         const r = spawnLocalSession({
           shell, args: shellArgs(shell, undefined, shellExtraArgs), opts: spawnOpts,
         });
-        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle;
+        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle; socketPath = r.socketPath;
       }
       // For zsh, ENV/BASH_ENV don't apply — write the function after shell starts
       setTimeout(() => {
@@ -1611,7 +1621,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         const r = spawnLocalSession({
           shell, args: shellArgs(shell, claudeCmd, shellExtraArgs), opts: spawnOpts,
         });
-        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle;
+        ptyProcess = r.ptyProcess; tmuxName = r.tmuxName; handle = r.handle; socketPath = r.socketPath;
       }
 
     }
@@ -1636,7 +1646,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       ? { remotePort: ideInfo.remotePort, localPort: ideInfo.mcpServer.port, sock: ideInfo.sock }
       : null,
     // Phase 1: tmux-backed local session persistence (null when disabled or remote).
-    tmuxName, handle,
+    // socketPath is derivable from handle (tmuxSession.socketPath), but kept
+    // here too so Task 5's kill-server lifecycle doesn't need to recompute it.
+    tmuxName, handle, socketPath,
   };
   activeSessions.set(sessionId, session);
 
@@ -1965,6 +1977,11 @@ app.whenReady().then(() => {
 
   TMUX_CONF_PATH = path.join(app.getPath('userData'), 'sb.tmux.conf');
   try { fs.writeFileSync(TMUX_CONF_PATH, tmuxSession.confContent()); } catch (e) { log.warn(`[tmux] conf write failed: ${e.message}`); }
+
+  // Per-session socket dir (2026-07-15 amendment): one tmux server per
+  // session lives on its own socket under here.
+  TMUX_SOCKET_DIR = path.join(app.getPath('userData'), 'sb-sockets');
+  try { fs.mkdirSync(TMUX_SOCKET_DIR, { recursive: true }); } catch (e) { log.warn(`[tmux] socket dir mkdir failed: ${e.message}`); }
 
   log.info(`[tmux] available=${tmuxAvailable} persistDefault=${settingsPersistOn()}`);
 

@@ -7,36 +7,50 @@ test('sessionName prefixes sb_ and sanitizes unsafe chars', () => {
   assert.equal(tm.sessionName('a b/c.d'), 'sb_a_b_c_d');
 });
 
-test('newSessionArgs builds attach-or-create argv with size, conf, env, command', () => {
+test('socketPath joins baseDir and a sanitized handle deterministically', () => {
+  assert.equal(tm.socketPath('/base/dir', 'abc123'), '/base/dir/sb-sock-abc123');
+  assert.equal(tm.socketPath('/base/dir', 'abc123'), tm.socketPath('/base/dir', 'abc123'));
+});
+
+test('socketPath sanitizes unsafe characters in the handle', () => {
+  assert.equal(tm.socketPath('/base', 'a b/c.d'), '/base/sb-sock-a_b_c_d');
+});
+
+test('socketPath strips trailing slashes from baseDir', () => {
+  assert.equal(tm.socketPath('/base/dir/', 'x'), '/base/dir/sb-sock-x');
+  assert.equal(tm.socketPath('/base/dir///', 'x'), '/base/dir/sb-sock-x');
+});
+
+test('newSessionArgs builds socket-prefixed attach-or-create argv with size, conf, command', () => {
   const args = tm.newSessionArgs({
     name: 'sb_x', cols: 120, rows: 30, confPath: '/tmp/sb.conf',
-    env: { CLAUDE_CODE_SSE_PORT: '4517' },
+    socketPath: '/tmp/sb-sock-x',
     command: ['/bin/zsh', '-l', '-i', '-c', 'claude --session-id x'],
   });
   assert.deepEqual(args, [
+    '-S', '/tmp/sb-sock-x',
     '-f', '/tmp/sb.conf',
     'new-session', '-A', '-s', 'sb_x',
     '-x', '120', '-y', '30',
-    '-e', 'CLAUDE_CODE_SSE_PORT=4517',
     '/bin/zsh', '-l', '-i', '-c', 'claude --session-id x',
   ]);
 });
 
-test('newSessionArgs omits env flags when env empty', () => {
-  const args = tm.newSessionArgs({ name: 'sb_x', cols: 80, rows: 24, confPath: '/c', env: {}, command: ['bash'] });
+test('newSessionArgs never includes -e (env rides the client environ, not argv)', () => {
+  const args = tm.newSessionArgs({
+    name: 'sb_x', cols: 80, rows: 24, confPath: '/c', socketPath: '/s',
+    command: ['bash'],
+  });
   assert.ok(!args.includes('-e'));
   assert.deepEqual(args.slice(-1), ['bash']);
 });
 
-test('kill/has/list arg builders', () => {
-  assert.deepEqual(tm.killArgs('sb_x'), ['kill-session', '-t', 'sb_x']);
-  assert.deepEqual(tm.hasSessionArgs('sb_x'), ['has-session', '-t', 'sb_x']);
-  assert.deepEqual(tm.listArgs(), ['ls', '-F', '#{session_name}']);
+test('hasSessionArgs targets the per-session socket', () => {
+  assert.deepEqual(tm.hasSessionArgs('sb_x', '/tmp/sb-sock-x'), ['-S', '/tmp/sb-sock-x', 'has-session', '-t', 'sb_x']);
 });
 
-test('parseSessionList keeps only sb_ names, trimmed', () => {
-  const out = 'sb_a\nother\n  sb_b \n\nmisc';
-  assert.deepEqual(tm.parseSessionList(out), ['sb_a', 'sb_b']);
+test('killServerArgs kills the per-session server on its socket', () => {
+  assert.deepEqual(tm.killServerArgs('/tmp/sb-sock-x'), ['-S', '/tmp/sb-sock-x', 'kill-server']);
 });
 
 test('confContent disables status bar and sets large history', () => {
